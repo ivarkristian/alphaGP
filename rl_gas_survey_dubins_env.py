@@ -18,7 +18,7 @@ from scipy.spatial import cKDTree
 import dubins
 from gpt_class_exactgpmodel import ExactGPModel
 import chem_utils
-import agents
+#import agents
 
 # %%
 # Definitions
@@ -117,9 +117,16 @@ class GasSurveyDubinsEnv(gym.Env):
             self.env_xy, self.values = env_xy, values
             self.cur_dir = random_scenario['cur_dir']
 
+        if self.env_xy is None:
+            raise ValueError("env_xy is None after offset_xy")
+        
         self.env_x_np = self.env_xy[:, 0].cpu().numpy()
         self.env_y_np = self.env_xy[:, 1].cpu().numpy()
-        self.env_vals_np = self.values.cpu().numpy()
+
+        if self.values is not None:
+            self.env_vals_np = self.values.cpu().numpy()
+        else:
+            self.env_vals_np = None
 
         self.parameter = random_scenario['parameter']
         self.depth = random_scenario['depth']
@@ -174,7 +181,7 @@ class GasSurveyDubinsEnv(gym.Env):
             type=self.kernel_type,
             lengthscale_constraint=self.ls_const,
         ).to(self.device)
-        self.mdl.covar_module.outputscale = self.sigma2_all
+        self.mdl.covar_module.outputscale = torch.tensor(self.sigma2_all, device=self.device)
         self.mdl.eval()
         self.llh.eval()
        
@@ -306,7 +313,7 @@ class GasSurveyDubinsEnv(gym.Env):
         if self.debug:
             if np.isnan(measurements).sum():
                 print(f'Measurements contains nans')
-                agents.plot_n(x=sample_coords_xy[:, 0], y=sample_coords_xy[:, 1], data_list=[np.ones_like(sample_coords_xy[:, 0])], path=sample_coords_xy)
+                #agents.plot_n(x=sample_coords_xy[:, 0], y=sample_coords_xy[:, 1], data_list=[np.ones_like(sample_coords_xy[:, 0])], path=sample_coords_xy)
 
         if self.timer:
             print(f't2 step: {time.process_time()-t}')
