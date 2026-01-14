@@ -25,22 +25,23 @@ import chem_utils
 
 # %%
 class GasSurveyDubinsEnv(gym.Env):
-    def __init__(self, scenario_bank=None, gp_ls_constraint=gpytorch.constraints.Interval(9, 11), gp_kernel_type='scale_rbf', gp_pred_resolution=[100, 100], r_weights=[1.0, 1.0, 1.0], turn_radius=250, channels=np.array([0, 1, 0, 0, 0]), reward_func='None', timer=False, debug=False, device=torch.device("cpu")):
+    def __init__(self, scenario_bank=None, gp_ls_constraint=gpytorch.constraints.Interval(9, 11), gp_kernel_type='scale_rbf', gp_pred_resolution=[100, 100], r_weights=[1.0, 1.0, 1.0], turn_radius=250, channels=np.array([0, 1, 0, 0, 0]), reward_func='None', timer=False, debug=False, device=torch.device("cpu"), return_torch=False):
         super(GasSurveyDubinsEnv, self).__init__()
         self.debug = debug
         self.timer = timer
+        self.return_torch = return_torch
         self.print_info_rate = 10
         self.turn_radius = turn_radius
         self.path_planner = dubins.Dubins(self.turn_radius-3, 1.0) #1.0 - sample every meter
 
         self.reward_func = reward_func
-        self.a_gas, self.a_var, self.a_dist = r_weights
-        
-        self.device = device
+        self.a_gas, self.a_var, self.a_dist = map(float, r_weights)
+
+        # Normalize device early so all tensors land on the intended backend.
+        self.device = torch.device(device)
         # Load scenario bank
-        if not scenario_bank:
-            print(f"You have to provide a scenario bank!")
-            return
+        if scenario_bank is None:
+            raise ValueError("You have to provide a scenario bank.")
         
         self.scenario_bank = scenario_bank
         self.max_offset_factors = (0.7, 0.7)
@@ -52,7 +53,7 @@ class GasSurveyDubinsEnv(gym.Env):
         # GP model parameters
         self.ls_const = gp_ls_constraint
         self.kernel_type = gp_kernel_type
-        self.obs_x, self.obs_y = gp_pred_resolution
+        self.obs_x, self.obs_y = map(int, gp_pred_resolution)
 
         # Steps until truncated=True (done)
         self.n_steps = 0
@@ -66,13 +67,16 @@ class GasSurveyDubinsEnv(gym.Env):
         # Including coord_x/y channels is a bit dangerous, should
         # randomize direction of scenarios, e.g. rotate by 90/180 deg
         # to avoid 'learning the coordinate system'
-        self.channels = channels
+        # Make a private copy to avoid accidental in-place mutation by the caller.
+        self.channels = np.asarray(channels, dtype=np.uint8).copy()
+        self._coords_signature = None
+        self._coord_tree = None
 
         self.max_samples = 0
         self.location_noise = 0.05
         self.location_radius = self.ls_const.upper_bound.item()
         # reset draws a random scenario, initializes GP model and sample memory
-        obs, _ = self.reset()
+        self.reset()
     
         # observation space
         self.observation_layers = spaces.Box(
@@ -97,13 +101,14 @@ class GasSurveyDubinsEnv(gym.Env):
             print(f'Ep {self.n_episodes}, mean reward = {(self.acc_reward/self.print_info_rate):.3}')
             self.acc_reward = 0
 
-        t = time.process_time()
+        if self.timer:
+            t = time.process_time()
         self.n_episodes += 1
         self.total_steps += self.n_steps
         self.n_steps = 0
         self.terminated = False
 
-        if random_scenario == None:
+        if random_scenario is None:
             # Draw a random scenario/snapshot
             random_scenario = self.scenario_bank.sample()
             self.rotation = random.choice([-90, 0, 90, 180])
@@ -114,19 +119,22 @@ class GasSurveyDubinsEnv(gym.Env):
 
             self.env_xy, self.values = self.scenario_bank.offset_xy(env_xy, values, self.max_offset_factors)
         else:
-            self.env_xy, self.values = env_xy, values
+            # Ensure provided data is on the target device for GP inference.
+            if env_xy is None:
+                raise ValueError("env_xy must be provided when random_scenario is not None")
+            self.env_xy = env_xy.to(self.device) if isinstance(env_xy, torch.Tensor) else torch.as_tensor(env_xy, device=self.device)
+            if values is None:
+                self.values = None
+            else:
+                self.values = values.to(self.device) if isinstance(values, torch.Tensor) else torch.as_tensor(values, device=self.device)
             self.cur_dir = random_scenario['cur_dir']
 
         if self.env_xy is None:
             raise ValueError("env_xy is None after offset_xy")
         
-        self.env_x_np = self.env_xy[:, 0].cpu().numpy()
-        self.env_y_np = self.env_xy[:, 1].cpu().numpy()
-
-        if self.values is not None:
-            self.env_vals_np = self.values.cpu().numpy()
-        else:
-            self.env_vals_np = None
+        # Cache torch views for sampling to keep data on the target device.
+        self.env_x = self.env_xy[:, 0]
+        self.env_y = self.env_xy[:, 1]
 
         self.parameter = random_scenario['parameter']
         self.depth = random_scenario['depth']
@@ -142,23 +150,34 @@ class GasSurveyDubinsEnv(gym.Env):
 
         self.maxdist=2*math.pi*self.turn_radius/4.0
 
-        # Init observation channels and 'truth'
-        self._create_obs_coords()
+        # Rebuild coordinate grid only if the scenario bounds changed.
+        coords_signature = (self.env_x_max, self.env_y_max, self.obs_x, self.obs_y)
+        if coords_signature != self._coords_signature:
+            self._create_obs_coords()
+            self._coords_signature = coords_signature
+            self._coord_tree = None  # cached KD-tree invalidated by new grid
 
-        obs_truth = np.zeros(len(self._coords_flat), dtype=np.float32)
-        radius = 2.0
-        #for c, coord in enumerate(self._coords_flat.cpu().numpy()):
-        #    obs_truth[c] = chem_utils.extract_synoptic_chemical_data_from_depth(self.env_x_np, self.env_y_np, self.env_vals_np, coord, radius)
-        
-        #self.obs_truth = obs_truth.reshape(self.obs_y, self.obs_x)
-
-        self.pred_mu_norm = np.zeros((self.obs_y, self.obs_x), dtype=np.uint8)
-        self.pred_mu_norm_clipped = np.zeros((self.obs_y, self.obs_x), dtype=np.uint8)
-        self.pred_var_norm = np.zeros_like(self.pred_mu_norm) + 255#self.sigma2_all
-        self.pred_var_norm_clipped = np.zeros_like(self.pred_mu_norm) + 255#self.sigma2_all
-        self.location = np.zeros_like(self.pred_mu_norm)
+        # Reuse observation buffers to avoid per-reset allocations.
+        obs_shape = (self.obs_y, self.obs_x)
+        if (not hasattr(self, "pred_mu_norm")) or (self.pred_mu_norm.shape != obs_shape):
+            self.pred_mu_norm = np.zeros(obs_shape, dtype=np.uint8)
+            self.pred_mu_norm_clipped = np.zeros(obs_shape, dtype=np.uint8)
+            self.pred_var_norm = np.full(obs_shape, 255, dtype=np.uint8)
+            self.pred_var_norm_clipped = np.full(obs_shape, 255, dtype=np.uint8)
+            self.location = np.zeros(obs_shape, dtype=np.uint8)
+        else:
+            self.pred_mu_norm.fill(0)
+            self.pred_mu_norm_clipped.fill(0)
+            self.pred_var_norm.fill(255)
+            self.pred_var_norm_clipped.fill(255)
+            self.location.fill(0)
+        if (not hasattr(self, "location_t")) or (self.location_t.shape != obs_shape):
+            self.location_t = torch.zeros(obs_shape, device=self.device, dtype=torch.uint8)
+        else:
+            self.location_t.zero_()
 
         # Init GP model
+        had_model = hasattr(self, 'mdl') or hasattr(self, 'llh')
         if hasattr(self, 'mdl'):
             self.mdl.cpu()
             del self.mdl
@@ -167,9 +186,10 @@ class GasSurveyDubinsEnv(gym.Env):
             self.llh.cpu()
             del self.llh
         
-        gc.collect()
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
+        if had_model:
+            gc.collect()
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
 
         self.llh = gpytorch.likelihoods.GaussianLikelihood().to(self.device)
         empty_x = torch.empty((0, 2), device=self.device)
@@ -194,10 +214,11 @@ class GasSurveyDubinsEnv(gym.Env):
         self.sample_idx_mdl = 0
 
         if (hasattr(self, 'sampled_coords') is False) or (self.max_samples != self.max_samples_old):
-            self.sampled_coords = torch.empty((self.max_samples, 2), device=self.device)
+            # Preallocate on device for GP updates without reallocating each step.
+            self.sampled_coords = torch.empty((self.max_samples, 2), device=self.device, dtype=torch.float32)
         
         if (hasattr(self, 'sampled_vals') is False) or (self.max_samples != self.max_samples_old):
-            self.sampled_vals = torch.empty(self.max_samples, device=self.device)
+            self.sampled_vals = torch.empty(self.max_samples, device=self.device, dtype=torch.float32)
         
         # Init location and heading. Should be random, but for Dubins paths
         # we ensure that location is not too close to area boundaries
@@ -209,21 +230,30 @@ class GasSurveyDubinsEnv(gym.Env):
         #loc_y = (self.env_y_max-1) * random.random()
         #self.heading = np.zeros(4)
         #self.heading[random.choice([0, 1, 2, 3])] += 1
-        self.heading = np.zeros(8)
+        self.heading = np.zeros(8, dtype=np.int8)
         self.heading[random.choice([0, 1, 2, 3, 4, 5, 6, 7])] += 1
 
-        self.obs_x_len=self.env_x_max/self.obs_x
-        self.obs_y_len=self.env_y_max/self.obs_y
-
-        self.loc = torch.tensor([loc_x, loc_y, self.depth], device=self.device)
+        # Keep a CPU copy of XY to avoid GPU->CPU sync in geometry/path code.
+        self.loc_xy_np = np.array([loc_x, loc_y], dtype=np.float32)
+        self.loc = torch.tensor([loc_x, loc_y, self.depth], device=self.device, dtype=torch.float32)
         if self.debug:
             print(f'reset loc: {loc_x:.2f}, {loc_y:.2f} hdg: {self.heading}')
 
-        self.make_circle(self.loc[0].cpu().numpy(), self.loc[1].cpu().numpy(), self.location_radius)
+        self.make_circle(self.loc_xy_np[0], self.loc_xy_np[1], self.location_radius)
 
         # Init prediction tensors
-        self.pred_mu = np.zeros((self.obs_y, self.obs_x), dtype=np.float32) + self.mu_all
-        self.pred_var = np.full_like(self.pred_mu, self.sigma2_all)
+        if (not hasattr(self, "pred_mu")) or (self.pred_mu.shape != obs_shape):
+            self.pred_mu = np.full(obs_shape, self.mu_all, dtype=np.float32)
+            self.pred_var = np.full(obs_shape, self.sigma2_all, dtype=np.float32)
+        else:
+            self.pred_mu.fill(self.mu_all)
+            self.pred_var.fill(self.sigma2_all)
+
+        # Torch copies keep reward computations on-device.
+        self.pred_mu_t = torch.full(obs_shape, self.mu_all, device=self.device, dtype=torch.float32)
+        self.pred_var_t = torch.full(obs_shape, self.sigma2_all, device=self.device, dtype=torch.float32)
+        self.pred_mu_norm_t = (self.pred_mu_t - self.min_concentration) / (self.max_concentration - self.min_concentration) * 255
+        self.pred_var_norm_t = self.pred_var_t / self.sigma2_all * 255
         
         if self.debug:
             self._assert_gpu_consistency()
@@ -237,27 +267,28 @@ class GasSurveyDubinsEnv(gym.Env):
 
     #@profile
     def step(self, action, speed=1.0, sample_freq=1.0):
-        tt = time.process_time()
-        t = time.process_time()
+        if self.timer:
+            tt = time.process_time()
+            t = tt
         self.n_steps += 1
         reward = 0.0
         # action = absolute (x,y) or Δx,Δy; clip, update GP, rewards...
-        start_time = '2020-01-01T02:10:00.000000000' # dummy time
-        synoptic = True
         #old_ind_y, old_ind_x = np.argwhere(self.location)[0]
-        old_var = self.pred_var_norm # remember to compare with correct new var  (norm, clipped etc.)
-        old_pred_mu = self.pred_mu
+        # Copy only when needed to avoid large per-step allocations.
+        use_var_reward = self.channels[0] == 0 and self.channels[1] == 1
+        use_ch11000 = self.channels[0] == 1 and self.channels[1] == 1 and self.reward_func != 'e2e'
+        old_var = self.pred_var_norm.copy() if use_var_reward else None
+        old_var_t = None
+        if use_ch11000:
+            # Torch copy keeps reward computation on-device without extra host transfers.
+            old_var_t = self.pred_var_norm_t.detach().clone()
+        old_pred_mu = None
+        if self.channels[0] == 1 and self.channels[1] == 1 and self.reward_func == 'e2e':
+            old_pred_mu = self.pred_mu.copy()
 
         if self.debug:
             print(f'step: {self.n_steps} Q-action: {action}')
         # expects action to be left, forward, right
-
-        # this is where we implement Thompson-like sampling and receding horizon planning
-        # - compute sampling coordinates for all three actions (we have all necessary functions for this)
-        # - sample all three actions from gpytorch posterior self.current_pred
-        # - for each action, compute new posterior based on the new samples
-        # - repeat above three lines for n planning depths (this is the part you must design, perhaps using a recurring function for maximum efficiency?)
-        # - find the action that leads to max total reward
 
         n_headings = len(self.heading)
         delta_xy, new_heading = move_with_heading(
@@ -266,7 +297,8 @@ class GasSurveyDubinsEnv(gym.Env):
         )
         #delta_xy, new_heading = self._dubins_delta_90(action, self.heading, self.turn_radius)
         noise = self._delta_add_noise(delta_xy, self.turn_radius)
-        new_xy = self.loc[:2].cpu().numpy() + delta_xy + noise
+        # Use cached CPU position to avoid device sync on each step.
+        new_xy = self.loc_xy_np + delta_xy + noise
 
         if self.debug:
             print(f'delta_xy: {delta_xy} ({noise}) new_xy: {new_xy} new_hdg: {new_heading}', end=' ')
@@ -278,9 +310,11 @@ class GasSurveyDubinsEnv(gym.Env):
             self.acc_reward += reward
             if self.debug:
                 print(f'out_of_bounds or facing_the_boundary = True')
-            return obs, float(reward), self.terminated, truncated, info
+            if self.return_torch:
+                reward = torch.as_tensor(reward, device=self.device, dtype=torch.float32)
+            return obs, float(reward) if not self.return_torch else reward, self.terminated, truncated, info
         else:
-            self.new_loc = torch.as_tensor([*new_xy, self.depth], dtype=torch.float32, device=self.device)
+            self.new_loc = torch.as_tensor([*new_xy, self.depth], dtype=self.loc.dtype, device=self.device)
         
         if self.timer:
             print(f't0 step: {time.process_time()-t}')
@@ -291,27 +325,35 @@ class GasSurveyDubinsEnv(gym.Env):
             self.acc_reward += reward
             if self.debug:
                 print(f'torch.allclose = True')
-            return obs, float(reward), self.terminated, truncated, info
+            if self.return_torch:
+                reward = torch.as_tensor(reward, device=self.device, dtype=torch.float32)
+            return obs, float(reward) if not self.return_torch else reward, self.terminated, truncated, info
 
-        t = time.process_time()
+        if self.timer:
+            t = time.process_time()
         #sample_coords = path.path([self.loc.cpu(), self.new_loc.cpu()], start_time, speed, sample_freq, synoptic)
-        start = (self.loc[0].cpu().numpy(), self.loc[1].cpu().numpy(), onehot_to_rad(self.heading))
+        start = (self.loc_xy_np[0], self.loc_xy_np[1], onehot_to_rad(self.heading))
         end = (new_xy[0], new_xy[1], onehot_to_rad(new_heading))
-        sample_coords_xy = self.path_planner.dubins_path(start, end)
+        sample_coords_xy = np.asarray(self.path_planner.dubins_path(start, end), dtype=np.float32)
         
         if self.timer:
             print(f't1 step: {time.process_time()-t}')
         
-        measurements = np.zeros(len(sample_coords_xy), dtype=np.float32)
         radius = 1.0 # Radius of sample averaging
         
-        t = time.process_time()
-        # Sampling from the z-scaled values
-        for c, coord in enumerate(sample_coords_xy):
-            measurements[c] = chem_utils.extract_synoptic_chemical_data_from_depth(self.env_x_np, self.env_y_np, self.env_vals_np, coord, radius)
+        if self.timer:
+            t = time.process_time()
+        # Sample directly on the torch device to avoid CPU/GPU round-trips.
+        measurements_t = chem_utils.torch_extract_synoptic_chemical_data_from_depth(
+            self.env_x,
+            self.env_y,
+            self.values,
+            sample_coords_xy,
+            radius,
+        )
 
         if self.debug:
-            if np.isnan(measurements).sum():
+            if torch.isnan(measurements_t).any():
                 print(f'Measurements contains nans')
                 #agents.plot_n(x=sample_coords_xy[:, 0], y=sample_coords_xy[:, 1], data_list=[np.ones_like(sample_coords_xy[:, 0])], path=sample_coords_xy)
 
@@ -319,7 +361,7 @@ class GasSurveyDubinsEnv(gym.Env):
             print(f't2 step: {time.process_time()-t}')
         
         if self.debug:
-            print(f'#Smp: {len(measurements)}', end=' ')
+            print(f'#Smp: {len(measurements_t)}', end=' ')
 
         end_idx = self.sample_idx + len(sample_coords_xy)
         if end_idx > self.max_samples:
@@ -327,16 +369,19 @@ class GasSurveyDubinsEnv(gym.Env):
 
         # Store new samples into the preallocated tensors
         self.sampled_coords[self.sample_idx:end_idx] = torch.as_tensor(sample_coords_xy, device=self.device, dtype=self.sampled_coords.dtype)
-        self.sampled_vals[self.sample_idx:end_idx] = torch.as_tensor(measurements, device=self.device, dtype=self.sampled_vals.dtype)
+        self.sampled_vals[self.sample_idx:end_idx] = measurements_t.to(device=self.device, dtype=self.sampled_vals.dtype)
         self.sample_idx = end_idx
 
-        t = time.process_time()
+        if self.timer:
+            t = time.process_time()
         self._estimate_local() # fill self.pred_mu, self.pred_var and norms
         if self.timer:
             print(f't3 step: {time.process_time()-t}')
         
         # Update location
+        # Update both device and CPU locations in sync.
         self.loc = self.new_loc.detach()
+        self.loc_xy_np = new_xy
         self.heading = new_heading
 
         #self.make_circle(self.loc[0].cpu().numpy(), self.loc[1].cpu().numpy(), self.location_radius)
@@ -349,7 +394,7 @@ class GasSurveyDubinsEnv(gym.Env):
             if self.reward_func == 'e2e':
                 reward = self._reward_e2e(old_pred_mu)
             else:
-                reward = self._reward_ch_11000(old_var, measurements)
+                reward = self._reward_ch_11000(old_var_t, measurements_t)
 
         self.acc_reward += reward
         
@@ -358,7 +403,9 @@ class GasSurveyDubinsEnv(gym.Env):
         
             #self._assert_gpu_consistency()
 
-        return obs, float(reward), self.terminated, truncated, info
+        if self.return_torch:
+            reward = torch.as_tensor(reward, device=self.device, dtype=torch.float32)
+        return obs, float(reward) if not self.return_torch else reward, self.terminated, truncated, info
     
     def render():
         pass
@@ -411,7 +458,45 @@ class GasSurveyDubinsEnv(gym.Env):
     
     def _reward_ch_11000(self, old_var, measurements):
         # compute reward (based on decrease in overall variance)
-        # old_var is actually self.pred_var_norm from previous step
+        # old_var is pred_var_norm from previous step
+        if isinstance(measurements, torch.Tensor):
+            old_var_t = old_var if isinstance(old_var, torch.Tensor) else torch.as_tensor(old_var, device=measurements.device)
+            pred_var_norm_t = getattr(self, "pred_var_norm_t", None)
+            if pred_var_norm_t is None:
+                pred_var_norm_t = torch.as_tensor(self.pred_var_norm, device=measurements.device)
+
+            if self.debug:
+                print(
+                    f'old_var_norm.mean: {old_var_t.mean().item():.4f} '
+                    f'pred_var_norm.mean: {pred_var_norm_t.mean().item():.4f}'
+                )
+
+            diff = old_var_t.mean() - pred_var_norm_t.mean()
+            cap = torch.tensor(2.0, device=measurements.device, dtype=diff.dtype)
+            var_red = torch.minimum(cap, diff)
+            # Max number of samples seems to be 22, so we scale with 22/len(measurements)
+            r_var = var_red * 22 / measurements.numel()
+
+            measurements_norm = (measurements - self.min_concentration) / (self.max_concentration - self.min_concentration) * 255
+            r_gas = (measurements_norm >= 5).to(measurements_norm.dtype).mean()
+
+            r_dist = torch.tensor(-1.0, device=measurements.device, dtype=measurements_norm.dtype)
+            r_term = 0.0
+            if pred_var_norm_t.mean().item() <= 125:
+                r_term = 5.0
+                self.terminated = True
+
+            reward = self.a_gas * r_gas + self.a_var * r_var + self.a_dist * r_dist + r_term
+
+            if self.debug:
+                print(
+                    f'r_gas: {r_gas.item():.4f}, r_var: {r_var.item():.4f}, '
+                    f'r_dist: {r_dist.item():.4f}, r_tot: {reward.item():.4f}'
+                )
+
+            return float(reward.item())
+
+        # NumPy fallback path.
         if self.debug:
             print(f'old_var_norm.mean: {old_var.mean():.4f} pred_var_norm.mean: {self.pred_var_norm.mean():.4f}')
 
@@ -610,15 +695,24 @@ class GasSurveyDubinsEnv(gym.Env):
         return x_idx, y_idx
     
     def _get_obs_truncated_info(self):
-        layers_uint8  = self._render_layers()
-        loc_x = ((self.loc[0]/self.env_x_max)*2.0 - 1.0).cpu()
-        loc_y = ((self.loc[1]/self.env_y_max)*2.0 - 1.0).cpu()
-
-        obs_dict = {
-            "map": layers_uint8,           # (C,H,W)
-            "loc": np.array([loc_x, loc_y], np.float32),
-            "hdg": self.heading
-        }
+        if self.return_torch:
+            layers = self._render_layers_torch()
+            loc_x = (self.loc[0] / self.env_x_max) * 2.0 - 1.0
+            loc_y = (self.loc[1] / self.env_y_max) * 2.0 - 1.0
+            obs_dict = {
+                "map": layers,  # (C,H,W) torch
+                "loc": torch.stack((loc_x, loc_y)).to(dtype=torch.float32),
+                "hdg": torch.as_tensor(self.heading, device=self.device, dtype=torch.float32),
+            }
+        else:
+            layers_uint8  = self._render_layers()
+            loc_x = ((self.loc[0]/self.env_x_max)*2.0 - 1.0).cpu()
+            loc_y = ((self.loc[1]/self.env_y_max)*2.0 - 1.0).cpu()
+            obs_dict = {
+                "map": layers_uint8,           # (C,H,W)
+                "loc": np.array([loc_x, loc_y], np.float32),
+                "hdg": self.heading
+            }
 
         truncated = (self.n_steps >= self.n_steps_max)
         info = {}
@@ -820,6 +914,12 @@ class GasSurveyDubinsEnv(gym.Env):
         self.pred_var_norm = self.pred_var/self.sigma2_all * 255
         self._normalize_pred_layers()
 
+        # Maintain torch versions for on-device rewards.
+        self.pred_mu_t = self.current_pred_mean.view(self.obs_y, self.obs_x)
+        self.pred_var_t = self.current_pred_variance.view(self.obs_y, self.obs_x)
+        self.pred_mu_norm_t = (self.pred_mu_t - self.min_concentration) / (self.max_concentration - self.min_concentration) * 255
+        self.pred_var_norm_t = self.pred_var_t / self.sigma2_all * 255
+
         return
     
     def _estimate(self):
@@ -866,6 +966,12 @@ class GasSurveyDubinsEnv(gym.Env):
         self.pred_var_norm = self.pred_var/self.sigma2_all * 255
         self._normalize_pred_layers()
 
+        # Maintain torch versions for on-device rewards.
+        self.pred_mu_t = current_pred.mean.view(self.obs_y, self.obs_x) + self.mu_all
+        self.pred_var_t = current_pred.variance.view(self.obs_y, self.obs_x)
+        self.pred_mu_norm_t = (self.pred_mu_t - self.min_concentration) / (self.max_concentration - self.min_concentration) * 255
+        self.pred_var_norm_t = self.pred_var_t / self.sigma2_all * 255
+
         return
 
     def _get_local_update_indices(self, corr_length, scale=3.0):
@@ -889,7 +995,7 @@ class GasSurveyDubinsEnv(gym.Env):
             new_samples = np.array(new_samples)
 
         # --- 2. Build KD-tree on all grid coordinates (cached between calls if possible) ---
-        if not hasattr(self, "_coord_tree"):
+        if not hasattr(self, "_coord_tree") or self._coord_tree is None:
             coords_np = self._coords_flat.detach().cpu().numpy()
             self._coord_tree = cKDTree(coords_np)
 
@@ -948,6 +1054,24 @@ class GasSurveyDubinsEnv(gym.Env):
         # Stack into (C, H, W) NumPy array expected by Gym
         stacked = np.stack(chosen_layers, axis=0).astype(np.uint8)
         return stacked
+
+    def _render_layers_torch(self) -> torch.Tensor:
+        """
+        Assemble the observation tensor on-device.
+        """
+        pred_mu = torch.clamp(self.pred_mu_norm_t, 0, 255)
+        pred_var = torch.clamp(self.pred_var_norm_t, 0, 255)
+        candidate_layers = [
+            pred_mu,              # idx 0
+            pred_var,             # idx 1
+            self.location_t,      # idx 2
+            self.coord_y_norm_t,  # idx 3
+            self.coord_x_norm_t,  # idx 4
+        ]
+        chosen_layers = [
+            layer for layer, flag in zip(candidate_layers, self.channels) if flag
+        ]
+        return torch.stack(chosen_layers, dim=0)
     
     def _normalize_pred_layers(self):
         self.pred_mu_norm_clipped = np.clip(self.pred_mu_norm, 0, 255).astype(np.uint8)
@@ -967,10 +1091,14 @@ class GasSurveyDubinsEnv(gym.Env):
         self._coord_y = gy           # (H, W)
         self._coords = np.stack([gx, gy], axis=-1).reshape(-1, 2)      # (H, W, 2)
         self._coords_flat = torch.as_tensor(self._coords, device=self.device)
+        self._coord_x_t = torch.as_tensor(self._coord_x, device=self.device)
+        self._coord_y_t = torch.as_tensor(self._coord_y, device=self.device)
         
         # -- 2. static coordinate channels, normalised [0, 255] --
         self.coord_x_norm = (gx / self.env_x_max) * 255  # (H, W)
         self.coord_y_norm = (gy / self.env_y_max) * 255  # (H, W)
+        self.coord_x_norm_t = (self._coord_x_t / self.env_x_max) * 255
+        self.coord_y_norm_t = (self._coord_y_t / self.env_y_max) * 255
 
         return
     
@@ -1014,6 +1142,11 @@ class GasSurveyDubinsEnv(gym.Env):
         # Write values in place
         self.location.fill(255)     # everything white
         self.location[mask] = 0     # black disk
+
+        if hasattr(self, "location_t"):
+            mask_t = (self._coord_x_t - x)**2 + (self._coord_y_t - y)**2 <= r*r
+            self.location_t.fill_(255)
+            self.location_t[mask_t] = 0
 
         return
 

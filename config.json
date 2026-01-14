@@ -1,0 +1,10 @@
+{
+  "seed": 123,
+  "device": "cpu",
+  "run_name": "debug",
+  "env_turn_radius": 25.0,
+  "train_num_iterations": 5,
+  "tensor_envs_dir": "/Users/ikw/code/SmartAUVs_digital_lab/tensor_envs",
+  "tensor_env_file": "/Users/ikw/code/SmartAUVs_digital_lab/tensor_envs/1c_pCO2_67_69.pt",
+  "figures_dir": "figures"
+}

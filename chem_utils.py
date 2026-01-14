@@ -4,6 +4,7 @@ from xarray.coding.times import SerializationWarning
 import numpy as np
 import pandas as pd
 import xarray as xr
+import torch
 
 def load_chemical_dataset(chem_data_path):
     """
@@ -96,6 +97,61 @@ def extract_synoptic_chemical_data_from_depth(x_coords, y_coords, values, sample
     return average_data_value
 
 
+def torch_extract_synoptic_chemical_data_from_depth(x_coords, y_coords, values, sample_coords, radius=1.0, method='mean'):
+    """
+    Torch implementation of extract_synoptic_chemical_data_from_depth.
+
+    Supports single sample coords (shape (2,)) or a batch of coords (shape (N, 2)).
+    Returns a torch scalar for a single sample or a 1-D tensor for a batch.
+    """
+    x_coords_t = x_coords if isinstance(x_coords, torch.Tensor) else torch.as_tensor(x_coords)
+    y_coords_t = y_coords if isinstance(y_coords, torch.Tensor) else torch.as_tensor(y_coords)
+    values_t = values if isinstance(values, torch.Tensor) else torch.as_tensor(values)
+
+    device = x_coords_t.device
+    dtype = x_coords_t.dtype
+    y_coords_t = y_coords_t.to(device=device, dtype=dtype)
+    values_t = values_t.to(device=device)
+
+    sample_coords_t = sample_coords if isinstance(sample_coords, torch.Tensor) else torch.as_tensor(sample_coords)
+    sample_coords_t = sample_coords_t.to(device=device, dtype=dtype)
+
+    if sample_coords_t.ndim == 1:
+        if sample_coords_t.numel() != 2:
+            raise ValueError("sample_coords must have shape (2,) for single-sample mode.")
+        x_target, y_target = sample_coords_t
+        x_diff = x_coords_t - x_target
+        y_diff = y_coords_t - y_target
+        distances = torch.sqrt(x_diff * x_diff + y_diff * y_diff)
+        within_radius = distances <= radius
+        data_within_radius = values_t[within_radius]
+        if method == 'mean':
+            return data_within_radius.mean()
+        if method == 'max':
+            return data_within_radius.max()
+        raise ValueError(f"Method {method} not recognized.")
+
+    if sample_coords_t.ndim == 2:
+        if sample_coords_t.shape[1] != 2:
+            raise ValueError("sample_coords must have shape (N, 2) for batch mode.")
+        dx = x_coords_t[:, None] - sample_coords_t[None, :, 0]
+        dy = y_coords_t[:, None] - sample_coords_t[None, :, 1]
+        distances = torch.sqrt(dx * dx + dy * dy)
+        within_radius = distances <= radius
+        if method == 'mean':
+            within_radius_f = within_radius.to(values_t.dtype)
+            sums = (values_t[:, None] * within_radius_f).sum(dim=0)
+            counts = within_radius_f.sum(dim=0)
+            return sums / counts
+        if method == 'max':
+            neg_inf = torch.tensor(float("-inf"), device=values_t.device, dtype=values_t.dtype)
+            masked = torch.where(within_radius, values_t[:, None], neg_inf)
+            return masked.max(dim=0).values
+        raise ValueError(f"Method {method} not recognized.")
+
+    raise ValueError("sample_coords must be a 1-D or 2-D tensor-like object.")
+
+
 def extract_chemical_data_from_dataset(dataset, metadata, data_variable):
     """
     Extracts chemical data within a specified spherical volume and computes the average data value.
@@ -161,6 +217,47 @@ def extract_chemical_data_from_dataset(dataset, metadata, data_variable):
     average_data_value = np.mean(data_within_radius)
 
     return average_data_value, data_within_radius
+
+
+def torch_extract_chemical_data_from_dataset(dataset, metadata, data_variable, device=None):
+    """
+    Torch implementation of extract_chemical_data_from_dataset.
+
+    The dataset is still read via xarray (CPU); tensors can optionally be moved
+    to a device for downstream GPU processing.
+    """
+    x_target, y_target, z_target, time_target, radius = metadata
+
+    device = torch.device(device) if device is not None else torch.device("cpu")
+
+    x_coords = torch.as_tensor(dataset["x"].values[:72710], device=device)
+    y_coords = torch.as_tensor(dataset["y"].values[:72710], device=device)
+
+    x_coord_target = x_coords.min() + torch.as_tensor(x_target, device=device, dtype=x_coords.dtype)
+    y_coord_target = y_coords.min() + torch.as_tensor(y_target, device=device, dtype=y_coords.dtype)
+    z_coord_target = torch.as_tensor(z_target, device=device, dtype=torch.float32)
+
+    siglay_depths = torch.arange(len(dataset["siglay"]), device=device, dtype=torch.float32)
+
+    x_diff = x_coords - x_coord_target
+    y_diff = y_coords - y_coord_target
+    z_diff = siglay_depths - z_coord_target
+
+    distances = torch.sqrt(
+        x_diff[:, None] * x_diff[:, None] +
+        y_diff[:, None] * y_diff[:, None] +
+        z_diff[None, :] * z_diff[None, :]
+    )
+
+    within_radius_indices = torch.where(distances <= radius)
+    unique_indices_within_radius = torch.unique(within_radius_indices[0])
+
+    data_array = dataset[data_variable].isel(time=time_target, siglay=int(z_coord_target.item())).values
+    data_values = torch.as_tensor(data_array, device=device)[unique_indices_within_radius]
+
+    average_data_value = data_values.mean()
+
+    return average_data_value, data_values
 
 
 if __name__ == "__main__":
