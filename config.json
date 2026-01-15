@@ -1,10 +1,67 @@
 {
-  "seed": 123,
-  "device": "cpu",
-  "run_name": "debug",
-  "env_turn_radius": 25.0,
-  "train_num_iterations": 5,
-  "tensor_envs_dir": "/Users/ikw/code/SmartAUVs_digital_lab/tensor_envs",
-  "tensor_env_file": "/Users/ikw/code/SmartAUVs_digital_lab/tensor_envs/1c_pCO2_67_69.pt",
-  "figures_dir": "figures"
+  "general": {
+    "seed": 123,
+    "device": "cpu",
+    "run_name": "debug",
+    "env_turn_radius": 25.0,
+    "tensor_envs_dir": "/Users/ikw/code/SmartAUVs_digital_lab/tensor_envs",
+    "tensor_env_file": "/Users/ikw/code/SmartAUVs_digital_lab/tensor_envs/1c_pCO2_67_69.pt",
+    "figures_dir": "figures",
+    "gas_type": "pCO2",
+    "gas_threshold": 550.0,
+    "sensor_range": [0.0, 2000.0]
+  },
+  "policy_net": {
+    "in_channels": 2,
+    "num_actions": 3,
+    "aux_dim": 10,
+    "trunk_channels": [32, 64, 128],
+    "latent_dim": 256,
+    "head_dim": 128,
+    "value_head_dim": 128
+  },
+  "mcts_test": {
+    "num_simulations": 50,
+    "cpuct": 1.5,
+    "discount": 1.0,
+    "temperature": 1.0,
+    "dirichlet_alpha": null,
+    "dirichlet_epsilon": 0.0,
+    "steps": 3,
+    "tree_depth_printout": 3,
+    "tree_depth_max": null,
+    "top_k": 3,
+    "plot_path": null
+  },
+  "mcts": {
+    "num_simulations": 50,
+    "cpuct": 1.5,
+    "discount": 1.0,
+    "temperature": 1.0,
+    "dirichlet_alpha": null,
+    "dirichlet_epsilon": 0.0,
+    "tree_depth_max": 10
+  },
+  "mcts_self_play": {
+    "num_episodes": 3,
+    "max_steps": 30,
+    "temperature": null
+  },
+  "train_config": {
+    "buffer_capacity": 1000000,
+    "batch_size": 32,
+    "train_steps": 10,
+    "learning_rate": 0.001,
+    "l2_weight": 0.0001,
+    "train_num_iterations": 10,
+    "checkpoint_dir": "checkpoints",
+    "checkpoint_every": 1,
+    "resume_path": null
+  },
+  "parallel": {
+    "num_workers": 2,
+    "episodes_per_iter": 4,
+    "queue_maxsize": 16,
+    "weight_sync_every": 1
+  }
 }

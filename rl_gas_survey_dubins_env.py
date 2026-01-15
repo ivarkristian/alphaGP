@@ -204,6 +204,9 @@ class GasSurveyDubinsEnv(gym.Env):
         self.mdl.covar_module.outputscale = torch.tensor(self.sigma2_all, device=self.device)
         self.mdl.eval()
         self.llh.eval()
+        for attr in ("current_pred_mean", "current_pred_variance"):
+            if hasattr(self, attr):
+                delattr(self, attr)
        
         #self.values_submuall = self.values-self.mu_all
         
@@ -232,6 +235,8 @@ class GasSurveyDubinsEnv(gym.Env):
         #self.heading[random.choice([0, 1, 2, 3])] += 1
         self.heading = np.zeros(8, dtype=np.int8)
         self.heading[random.choice([0, 1, 2, 3, 4, 5, 6, 7])] += 1
+        if self.return_torch:
+            self.heading_t = torch.as_tensor(self.heading, device=self.device)
 
         # Keep a CPU copy of XY to avoid GPU->CPU sync in geometry/path code.
         self.loc_xy_np = np.array([loc_x, loc_y], dtype=np.float32)
@@ -277,33 +282,78 @@ class GasSurveyDubinsEnv(gym.Env):
         # Copy only when needed to avoid large per-step allocations.
         use_var_reward = self.channels[0] == 0 and self.channels[1] == 1
         use_ch11000 = self.channels[0] == 1 and self.channels[1] == 1 and self.reward_func != 'e2e'
-        old_var = self.pred_var_norm.copy() if use_var_reward else None
+        old_var = None
         old_var_t = None
-        if use_ch11000:
-            # Torch copy keeps reward computation on-device without extra host transfers.
-            old_var_t = self.pred_var_norm_t.detach().clone()
+        if use_var_reward or use_ch11000:
+            if self.return_torch:
+                # Torch copy keeps reward computation on-device without extra host transfers.
+                old_var_t = self.pred_var_norm_t.detach().clone()
+            else:
+                old_var = self.pred_var_norm.copy()
         old_pred_mu = None
         if self.channels[0] == 1 and self.channels[1] == 1 and self.reward_func == 'e2e':
-            old_pred_mu = self.pred_mu.copy()
+            if self.return_torch:
+                old_pred_mu = self.pred_mu_t.detach().clone()
+            else:
+                old_pred_mu = self.pred_mu.copy()
+
+        action_t = None
+        if self.return_torch:
+            if torch.is_tensor(action):
+                if action.numel() != 1:
+                    raise ValueError("action tensor must contain a single scalar.")
+                action_t = action.to(device=self.device)
+            else:
+                action_t = torch.as_tensor(action, device=self.device)
+        else:
+            if torch.is_tensor(action):
+                if action.numel() != 1:
+                    raise ValueError("action tensor must contain a single scalar.")
+                action = int(action.item())
 
         if self.debug:
-            print(f'step: {self.n_steps} Q-action: {action}')
+            dbg_action = int(action_t.item()) if torch.is_tensor(action_t) else action
+            print(f'step: {self.n_steps} Q-action: {dbg_action}')
         # expects action to be left, forward, right
 
-        n_headings = len(self.heading)
-        delta_xy, new_heading = move_with_heading(
-            heading_1hot=self.heading, action=action, turn_radius=self.turn_radius,
-            turn_degrees=int(360/n_headings), n_headings=n_headings, straight_matches_arc=True
-        )
-        #delta_xy, new_heading = self._dubins_delta_90(action, self.heading, self.turn_radius)
-        noise = self._delta_add_noise(delta_xy, self.turn_radius)
-        # Use cached CPU position to avoid device sync on each step.
-        new_xy = self.loc_xy_np + delta_xy + noise
+        if self.return_torch:
+            heading_t = self.heading_t if hasattr(self, "heading_t") else torch.as_tensor(self.heading, device=self.device)
+            n_headings = int(heading_t.numel())
+            delta_xy, new_heading = move_with_heading(
+                heading_1hot=heading_t,
+                action=action_t,
+                turn_radius=self.turn_radius,
+                turn_degrees=int(360 / n_headings),
+                n_headings=n_headings,
+                straight_matches_arc=True,
+            )
+            noise = self._delta_add_noise(delta_xy, self.turn_radius)
+            new_xy = self.loc[:2] + delta_xy + noise
+        else:
+            n_headings = len(self.heading)
+            delta_xy, new_heading = move_with_heading(
+                heading_1hot=self.heading,
+                action=action,
+                turn_radius=self.turn_radius,
+                turn_degrees=int(360 / n_headings),
+                n_headings=n_headings,
+                straight_matches_arc=True,
+            )
+            #delta_xy, new_heading = self._dubins_delta_90(action, self.heading, self.turn_radius)
+            noise = self._delta_add_noise(delta_xy, self.turn_radius)
+            # Use cached CPU position to avoid device sync on each step.
+            new_xy = self.loc_xy_np + delta_xy + noise
 
         if self.debug:
             print(f'delta_xy: {delta_xy} ({noise}) new_xy: {new_xy} new_hdg: {new_heading}', end=' ')
-        out_of_bounds = not ((0 <= new_xy[0] <= self.env_x_max) and (0 <= new_xy[1] <= self.env_y_max))
-        facing_the_boundary = self._facing_the_boundary(new_xy, new_heading)
+        if self.return_torch:
+            out_of_bounds = bool(
+                ((new_xy[0] < 0) | (new_xy[0] > self.env_x_max) | (new_xy[1] < 0) | (new_xy[1] > self.env_y_max)).item()
+            )
+            facing_the_boundary = self._facing_the_boundary(new_xy, new_heading)
+        else:
+            out_of_bounds = not ((0 <= new_xy[0] <= self.env_x_max) and (0 <= new_xy[1] <= self.env_y_max))
+            facing_the_boundary = self._facing_the_boundary(new_xy, new_heading)
         if out_of_bounds or facing_the_boundary:
             obs, truncated, info = self._get_obs_truncated_info()
             reward += -5.0
@@ -314,7 +364,10 @@ class GasSurveyDubinsEnv(gym.Env):
                 reward = torch.as_tensor(reward, device=self.device, dtype=torch.float32)
             return obs, float(reward) if not self.return_torch else reward, self.terminated, truncated, info
         else:
-            self.new_loc = torch.as_tensor([*new_xy, self.depth], dtype=self.loc.dtype, device=self.device)
+            if self.return_torch:
+                self.new_loc = torch.stack((new_xy[0], new_xy[1], self.loc[2])).to(dtype=self.loc.dtype, device=self.device)
+            else:
+                self.new_loc = torch.as_tensor([*new_xy, self.depth], dtype=self.loc.dtype, device=self.device)
         
         if self.timer:
             print(f't0 step: {time.process_time()-t}')
@@ -332,9 +385,12 @@ class GasSurveyDubinsEnv(gym.Env):
         if self.timer:
             t = time.process_time()
         #sample_coords = path.path([self.loc.cpu(), self.new_loc.cpu()], start_time, speed, sample_freq, synoptic)
-        start = (self.loc_xy_np[0], self.loc_xy_np[1], onehot_to_rad(self.heading))
-        end = (new_xy[0], new_xy[1], onehot_to_rad(new_heading))
-        sample_coords_xy = np.asarray(self.path_planner.dubins_path(start, end), dtype=np.float32)
+        if self.return_torch:
+            sample_coords_xy = self._generate_path_torch(self.loc[:2], heading_t, action_t, noise)
+        else:
+            start = (self.loc_xy_np[0], self.loc_xy_np[1], onehot_to_rad(self.heading))
+            end = (new_xy[0], new_xy[1], onehot_to_rad(new_heading))
+            sample_coords_xy = np.asarray(self.path_planner.dubins_path(start, end), dtype=np.float32)
         
         if self.timer:
             print(f't1 step: {time.process_time()-t}')
@@ -368,7 +424,10 @@ class GasSurveyDubinsEnv(gym.Env):
             raise RuntimeError(f"Exceeded maximum number of samples ({end_idx} > {self.max_samples})")
 
         # Store new samples into the preallocated tensors
-        self.sampled_coords[self.sample_idx:end_idx] = torch.as_tensor(sample_coords_xy, device=self.device, dtype=self.sampled_coords.dtype)
+        if self.return_torch:
+            self.sampled_coords[self.sample_idx:end_idx] = sample_coords_xy.to(device=self.device, dtype=self.sampled_coords.dtype)
+        else:
+            self.sampled_coords[self.sample_idx:end_idx] = torch.as_tensor(sample_coords_xy, device=self.device, dtype=self.sampled_coords.dtype)
         self.sampled_vals[self.sample_idx:end_idx] = measurements_t.to(device=self.device, dtype=self.sampled_vals.dtype)
         self.sample_idx = end_idx
 
@@ -381,22 +440,28 @@ class GasSurveyDubinsEnv(gym.Env):
         # Update location
         # Update both device and CPU locations in sync.
         self.loc = self.new_loc.detach()
-        self.loc_xy_np = new_xy
-        self.heading = new_heading
+        if self.return_torch:
+            self.heading_t = new_heading.to(device=self.device)
+        else:
+            self.loc_xy_np = new_xy
+            self.heading = new_heading
 
         #self.make_circle(self.loc[0].cpu().numpy(), self.loc[1].cpu().numpy(), self.location_radius)
         
         obs, truncated, info = self._get_obs_truncated_info()
         
         if self.channels[0] == 0 and self.channels[1] == 1:
-            reward = self._reward_ch_01000(old_var)
+            reward = self._reward_ch_01000(old_var_t if self.return_torch else old_var)
         elif self.channels[0] == 1 and self.channels[1] == 1:
             if self.reward_func == 'e2e':
                 reward = self._reward_e2e(old_pred_mu)
             else:
-                reward = self._reward_ch_11000(old_var_t, measurements_t)
+                reward = self._reward_ch_11000(old_var_t if self.return_torch else old_var, measurements_t)
 
-        self.acc_reward += reward
+        if torch.is_tensor(reward):
+            self.acc_reward += float(reward.item())
+        else:
+            self.acc_reward += reward
         
         if self.timer:
             print(f'step took: {time.process_time()-tt}')
@@ -404,7 +469,7 @@ class GasSurveyDubinsEnv(gym.Env):
             #self._assert_gpu_consistency()
 
         if self.return_torch:
-            reward = torch.as_tensor(reward, device=self.device, dtype=torch.float32)
+            reward = reward if torch.is_tensor(reward) else torch.as_tensor(reward, device=self.device, dtype=torch.float32)
         return obs, float(reward) if not self.return_torch else reward, self.terminated, truncated, info
     
     def render():
@@ -414,6 +479,39 @@ class GasSurveyDubinsEnv(gym.Env):
         pass
     
     def _reward_e2e(self, old_pred_mu):
+        if isinstance(old_pred_mu, torch.Tensor) or self.return_torch:
+            if hasattr(self, "obs_truth_t"):
+                obs_truth_t = self.obs_truth_t
+            elif hasattr(self, "obs_truth"):
+                obs_truth_t = torch.as_tensor(self.obs_truth, device=self.device, dtype=torch.float32)
+            else:
+                raise ValueError("obs_truth is not set for e2e reward computation.")
+
+            old_pred_mu_t = old_pred_mu if isinstance(old_pred_mu, torch.Tensor) else torch.as_tensor(old_pred_mu, device=obs_truth_t.device, dtype=torch.float32)
+            pred_mu_t = getattr(self, "pred_mu_t", None)
+            if pred_mu_t is None:
+                pred_mu_t = torch.as_tensor(self.pred_mu, device=obs_truth_t.device, dtype=torch.float32)
+
+            old_mean = (old_pred_mu_t - obs_truth_t).mean()
+            mean = (pred_mu_t - obs_truth_t).mean()
+            old_rms = torch.sqrt(old_mean * old_mean)
+            rms = torch.sqrt(mean * mean)
+
+            if old_pred_mu_t.mean().item() == 0:
+                old_rms = rms
+
+            if self.debug:
+                print(f'old_rms.mean: {old_rms.item():.4} rms: {rms.item():.4}')
+
+            r_rms = old_rms - rms
+            r_dist = torch.tensor(-1.0, device=obs_truth_t.device, dtype=r_rms.dtype)
+            reward = self.a_var * r_rms + self.a_dist * r_dist
+
+            if self.debug:
+                print(f'r_rms: {r_rms.item():.4}, r_dist: {r_dist.item():.4}, r_tot: {reward.item():.4}')
+
+            return reward
+
         old_rms = np.sqrt((old_pred_mu - self.obs_truth).mean()**2)
         rms = np.sqrt((self.pred_mu - self.obs_truth).mean()**2)
         
@@ -435,6 +533,38 @@ class GasSurveyDubinsEnv(gym.Env):
     
     def _reward_ch_01000(self, old_var):
         # compute reward (based on decrease in overall variance)
+        if isinstance(old_var, torch.Tensor):
+            pred_var_norm_t = getattr(self, "pred_var_norm_t", None)
+            if pred_var_norm_t is None:
+                pred_var_norm_t = torch.as_tensor(self.pred_var_norm, device=old_var.device)
+
+            if self.debug:
+                print(
+                    f'old_var.mean: {old_var.mean().item():.4f} '
+                    f'pred_var_norm.mean: {pred_var_norm_t.mean().item():.4f}'
+                )
+
+            diff = old_var.mean() - pred_var_norm_t.mean()
+            cap = torch.tensor(2.0, device=old_var.device, dtype=diff.dtype)
+            var_red = torch.minimum(cap, diff)
+            r_var = var_red
+            r_dist = torch.tensor(-1.0, device=old_var.device, dtype=diff.dtype)
+            r_term = torch.tensor(0.0, device=old_var.device, dtype=diff.dtype)
+
+            if pred_var_norm_t.mean().item() <= 100:
+                r_term = torch.tensor(5.0, device=old_var.device, dtype=diff.dtype)
+                self.terminated = True
+
+            reward = self.a_var * r_var + self.a_dist * r_dist + r_term
+
+            if self.debug:
+                print(
+                    f'r_var: {r_var.item():.4f}, r_dist: {r_dist.item():.4f}, '
+                    f'r_tot: {reward.item():.4f}'
+                )
+
+            return reward
+
         if self.debug:
             print(f'old_var.mean: {old_var.mean():.4f} pred_var_norm.mean: {self.pred_var_norm.mean():.4f}')
 
@@ -481,9 +611,9 @@ class GasSurveyDubinsEnv(gym.Env):
             r_gas = (measurements_norm >= 5).to(measurements_norm.dtype).mean()
 
             r_dist = torch.tensor(-1.0, device=measurements.device, dtype=measurements_norm.dtype)
-            r_term = 0.0
+            r_term = torch.tensor(0.0, device=measurements.device, dtype=measurements_norm.dtype)
             if pred_var_norm_t.mean().item() <= 125:
-                r_term = 5.0
+                r_term = torch.tensor(5.0, device=measurements.device, dtype=measurements_norm.dtype)
                 self.terminated = True
 
             reward = self.a_gas * r_gas + self.a_var * r_var + self.a_dist * r_dist + r_term
@@ -494,7 +624,7 @@ class GasSurveyDubinsEnv(gym.Env):
                     f'r_dist: {r_dist.item():.4f}, r_tot: {reward.item():.4f}'
                 )
 
-            return float(reward.item())
+            return reward
 
         # NumPy fallback path.
         if self.debug:
@@ -637,6 +767,11 @@ class GasSurveyDubinsEnv(gym.Env):
         return np.array([dx, dy]), np.array(new_heading)
 
     def _delta_add_noise(self, delta_xy, step, max_percentage=0.05):
+        if torch.is_tensor(delta_xy):
+            max_noise = max_percentage * delta_xy.abs()
+            noise = (torch.rand_like(delta_xy) - 0.5) * 2.0 * max_noise
+            return noise
+
         max_noise_x = max_percentage * abs(delta_xy[0])
         max_noise_y = max_percentage * abs(delta_xy[1])
         x_noise = (random.random() - 0.5)*2 * max_noise_x
@@ -644,48 +779,128 @@ class GasSurveyDubinsEnv(gym.Env):
         
         return np.array([x_noise, y_noise])
 
+    def _generate_path_torch(self, loc_xy, heading_1hot, action, noise):
+        """
+        Generate per-step sample coordinates using torch only.
+        """
+        if not torch.is_tensor(loc_xy):
+            loc_xy = torch.as_tensor(loc_xy, device=self.device, dtype=torch.float32)
+        if not torch.is_tensor(heading_1hot):
+            heading_1hot = torch.as_tensor(heading_1hot, device=self.device)
+        if torch.is_tensor(action):
+            if action.numel() != 1:
+                raise ValueError("action tensor must be a single scalar")
+            action_idx = action.to(device=self.device, dtype=torch.long)
+        elif isinstance(action, str):
+            action = action.lower()
+            if action not in ("left", "straight", "right"):
+                raise ValueError("action must be 'left', 'straight', or 'right'")
+            action_idx = torch.tensor(("left", "straight", "right").index(action), device=self.device, dtype=torch.long)
+        else:
+            action_idx_val = int(action)
+            if action_idx_val not in (0, 1, 2):
+                raise ValueError("action must be 0:'left', 1:'straight', 2:'right'")
+            action_idx = torch.as_tensor(action_idx_val, device=self.device, dtype=torch.long)
+
+        n_headings = int(heading_1hot.numel())
+        idx = torch.argmax(heading_1hot).to(dtype=torch.float32)
+        psi = (2.0 * math.pi * idx) / n_headings
+
+        r = float(self.turn_radius)
+        theta = math.radians(360.0 / n_headings)
+        arc_len = r * theta
+        n_points = max(2, int(arc_len / self.path_planner.point_separation) + 1)
+        t = torch.linspace(0.0, 1.0, n_points, device=self.device)
+
+        cos_psi = torch.cos(psi)
+        sin_psi = torch.sin(psi)
+        dx = arc_len * t * cos_psi
+        dy = arc_len * t * sin_psi
+        coords_straight = loc_xy + torch.stack((dx, dy), dim=1)
+
+        theta_t = torch.tensor(theta, device=self.device, dtype=torch.float32)
+        center_left = loc_xy + r * torch.stack((-sin_psi, cos_psi))
+        phi0_left = torch.atan2(loc_xy[1] - center_left[1], loc_xy[0] - center_left[0])
+        phi_left = phi0_left + t * theta_t
+        coords_left = center_left + r * torch.stack((torch.cos(phi_left), torch.sin(phi_left)), dim=1)
+
+        center_right = loc_xy + r * torch.stack((sin_psi, -cos_psi))
+        phi0_right = torch.atan2(loc_xy[1] - center_right[1], loc_xy[0] - center_right[0])
+        phi_right = phi0_right - t * theta_t
+        coords_right = center_right + r * torch.stack((torch.cos(phi_right), torch.sin(phi_right)), dim=1)
+
+        coords_all = torch.stack((coords_left, coords_straight, coords_right), dim=0)
+        coords = coords_all.index_select(0, action_idx.view(1)).squeeze(0)
+
+        if torch.is_tensor(noise):
+            coords = coords + noise.view(1, 2)
+        return coords
+
     def _facing_the_boundary(self, new_loc, new_heading):
+        if torch.is_tensor(new_loc):
+            new_loc_t = new_loc
+        else:
+            new_loc_t = torch.as_tensor(new_loc, device=self.device, dtype=torch.float32)
+
+        if torch.is_tensor(new_heading):
+            h_idx = int(torch.argmax(new_heading).item())
+        else:
+            h_idx = list(new_heading).index(1)
+
         if len(new_heading) == 4:
             headings = ('east', 'north', 'west', 'south')
         elif len(new_heading) == 8:
             headings = ('east', 'ne', 'north', 'nw', 'west', 'sw', 'south', 'se')
-
-        # headings = ('north', 'south', 'west', 'east')
-        h_idx = list(new_heading).index(1)
         
         match headings[h_idx]:
             case 'east':
-                return new_loc[0] > self.env_x_max - self.turn_radius
+                return bool((new_loc_t[0] > self.env_x_max - self.turn_radius).item())
             case 'ne':
                 cx = self.env_x_max - self.turn_radius
                 cy = self.env_y_max - self.turn_radius
-                return (new_loc[0] > self.env_x_max - self.turn_radius/3 or
-                    new_loc[1] > self.env_y_max - self.turn_radius/3 or
-                    (new_loc[0] - cx)**2 + (new_loc[1] - cy)**2 < self.turn_radius**2)
+                return bool(
+                    (
+                        (new_loc_t[0] > self.env_x_max - self.turn_radius/3)
+                        | (new_loc_t[1] > self.env_y_max - self.turn_radius/3)
+                        | ((new_loc_t[0] - cx)**2 + (new_loc_t[1] - cy)**2 < self.turn_radius**2)
+                    ).item()
+                )
             case 'north':
-                return new_loc[1] > self.env_y_max - self.turn_radius
+                return bool((new_loc_t[1] > self.env_y_max - self.turn_radius).item())
             case 'nw':
                 cx = self.turn_radius
                 cy = self.env_y_max - self.turn_radius
-                return (new_loc[0] < self.turn_radius/3 or
-                    new_loc[1] > self.env_y_max - self.turn_radius/3 or
-                    (new_loc[0] - cx)**2 + (new_loc[1] - cy)**2 < self.turn_radius**2)
+                return bool(
+                    (
+                        (new_loc_t[0] < self.turn_radius/3)
+                        | (new_loc_t[1] > self.env_y_max - self.turn_radius/3)
+                        | ((new_loc_t[0] - cx)**2 + (new_loc_t[1] - cy)**2 < self.turn_radius**2)
+                    ).item()
+                )
             case 'west':
-                return new_loc[0] < self.turn_radius
+                return bool((new_loc_t[0] < self.turn_radius).item())
             case 'sw':
                 cx = self.turn_radius
                 cy = self.turn_radius
-                return (new_loc[0] < self.turn_radius/3 or
-                    new_loc[1] < self.turn_radius/3 or
-                    (new_loc[0] - cx)**2 + (new_loc[1] - cy)**2 < self.turn_radius**2)
+                return bool(
+                    (
+                        (new_loc_t[0] < self.turn_radius/3)
+                        | (new_loc_t[1] < self.turn_radius/3)
+                        | ((new_loc_t[0] - cx)**2 + (new_loc_t[1] - cy)**2 < self.turn_radius**2)
+                    ).item()
+                )
             case 'south':
-                return new_loc[1] < self.turn_radius
+                return bool((new_loc_t[1] < self.turn_radius).item())
             case 'se':
                 cx = self.env_x_max - self.turn_radius
                 cy = self.turn_radius
-                return (new_loc[0] > self.env_x_max - self.turn_radius/3 or
-                    new_loc[1] < self.turn_radius/3 or
-                    (new_loc[0] - cx)**2 + (new_loc[1] - cy)**2 < self.turn_radius**2)
+                return bool(
+                    (
+                        (new_loc_t[0] > self.env_x_max - self.turn_radius/3)
+                        | (new_loc_t[1] < self.turn_radius/3)
+                        | ((new_loc_t[0] - cx)**2 + (new_loc_t[1] - cy)**2 < self.turn_radius**2)
+                    ).item()
+                )
 
         return False
  
@@ -699,10 +914,11 @@ class GasSurveyDubinsEnv(gym.Env):
             layers = self._render_layers_torch()
             loc_x = (self.loc[0] / self.env_x_max) * 2.0 - 1.0
             loc_y = (self.loc[1] / self.env_y_max) * 2.0 - 1.0
+            heading_t = self.heading_t if hasattr(self, "heading_t") else torch.as_tensor(self.heading, device=self.device)
             obs_dict = {
                 "map": layers,  # (C,H,W) torch
                 "loc": torch.stack((loc_x, loc_y)).to(dtype=torch.float32),
-                "hdg": torch.as_tensor(self.heading, device=self.device, dtype=torch.float32),
+                "hdg": heading_t.to(dtype=torch.float32),
             }
         else:
             layers_uint8  = self._render_layers()
@@ -860,12 +1076,31 @@ class GasSurveyDubinsEnv(gym.Env):
             if self.debug:
                 print(f'Created model in ._estimate()')
             self.mdl = ExactGPModel(self.sampled_coords, self.sampled_vals-self.mu_all, self.llh, self.kernel_type, lengthscale_constraint=self.ls_const).to(self.device)
+
+        def _ensure_current_pred():
+            if hasattr(self, "current_pred_mean") and hasattr(self, "current_pred_variance"):
+                return
+            with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                current_pred = self.mdl(self._coords_flat)
+                self.current_pred_mean = current_pred.mean + self.mu_all
+                self.current_pred_variance = current_pred.variance
+
+        def _ensure_prediction_cache():
+            if self.mdl.prediction_strategy is not None:
+                return
+            with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                _ = self.mdl(self._coords_flat[:1])
         
         t = time.process_time()
         #self.mdl.set_train_data(
         #    inputs=self.sampled_coords[:self.sample_idx], targets=self.sampled_vals[:self.sample_idx]-self.mu_all, strict=False)
         if len(self.mdl.train_targets) > 0:
             # not first prediction, use fantasy mdl
+            if self.mdl.prediction_strategy is None:
+                if hasattr(self, "current_pred_mean") and hasattr(self, "current_pred_variance"):
+                    _ensure_prediction_cache()
+                else:
+                    _ensure_current_pred()
             self.mdl = self.mdl.get_fantasy_model(self.sampled_coords[self.sample_idx_mdl:self.sample_idx], self.sampled_vals[self.sample_idx_mdl:self.sample_idx]-self.mu_all).to(self.device)
         else:
             # first prediction must have train data
@@ -874,20 +1109,19 @@ class GasSurveyDubinsEnv(gym.Env):
             
             if self.debug:
                 self.mdl.print_named_parameters()
+            _ensure_current_pred()
             
         if self.timer:
             print(f't3.1 step: {time.process_time()-t}')
-
-        if not hasattr(self, "current_pred"):
-            with torch.no_grad(), gpytorch.settings.fast_pred_var():
-                current_pred = self.mdl(self._coords_flat)
-                self.current_pred_mean = current_pred.mean + self.mu_all
-                self.current_pred_variance = current_pred.variance
+        _ensure_current_pred()
 
         # Then predict local coords around acquired samples
         t = time.process_time()
-        lengthscale = float(self.mdl.covar_module.base_kernel.lengthscale.squeeze().cpu())
-        self.idx_local = self._get_local_update_indices(corr_length=lengthscale)
+        lengthscale = self.mdl.covar_module.base_kernel.lengthscale.squeeze()
+        if self.return_torch:
+            self.idx_local = self._get_local_update_indices(corr_length=lengthscale)
+        else:
+            self.idx_local = self._get_local_update_indices(corr_length=float(lengthscale.detach().cpu()))
         coords_local = self._coords_flat[self.idx_local]
         
         if len(coords_local) > 0:
@@ -900,8 +1134,9 @@ class GasSurveyDubinsEnv(gym.Env):
             #self.debug_local_gp_update(self.idx_local)
             #self.debug_gp_update_values(self._tensor_to_obs_channel(self.current_pred_mean))
             
-            self.pred_mu = self._tensor_to_obs_channel(self.current_pred_mean)
-            self.pred_var = self._tensor_to_obs_channel(self.current_pred_variance)
+            if not self.return_torch:
+                self.pred_mu = self._tensor_to_obs_channel(self.current_pred_mean)
+                self.pred_var = self._tensor_to_obs_channel(self.current_pred_variance)
             
         self.sample_idx_mdl = self.sample_idx
 
@@ -910,11 +1145,12 @@ class GasSurveyDubinsEnv(gym.Env):
         
         # Scale to 0-255 ([min_conc, max_conc] from scenario bank)
         t = time.process_time()
-        self.pred_mu_norm = (self.pred_mu - self.min_concentration) / (self.max_concentration - self.min_concentration) * 255
-        self.pred_var_norm = self.pred_var/self.sigma2_all * 255
-        self._normalize_pred_layers()
+        if not self.return_torch:
+            self.pred_mu_norm = (self.pred_mu - self.min_concentration) / (self.max_concentration - self.min_concentration) * 255
+            self.pred_var_norm = self.pred_var/self.sigma2_all * 255
+            self._normalize_pred_layers()
 
-        # Maintain torch versions for on-device rewards.
+        # Maintain torch versions for on-device rewards and observations.
         self.pred_mu_t = self.current_pred_mean.view(self.obs_y, self.obs_x)
         self.pred_var_t = self.current_pred_variance.view(self.obs_y, self.obs_x)
         self.pred_mu_norm_t = (self.pred_mu_t - self.min_concentration) / (self.max_concentration - self.min_concentration) * 255
@@ -955,16 +1191,17 @@ class GasSurveyDubinsEnv(gym.Env):
             print(f't3.2 step: {time.process_time()-t}')
 
         t = time.process_time()
-        self.pred_mu = self._tensor_to_obs_channel(current_pred.mean + self.mu_all)
-        self.pred_var = self._tensor_to_obs_channel(current_pred.variance)
-        if self.timer:
-            print(f't3.3 step: {time.process_time()-t}')
-        
-        # Scale to 0-255 ([min_conc, max_conc] from scenario bank)
-        t = time.process_time()
-        self.pred_mu_norm = (self.pred_mu - self.min_concentration) / (self.max_concentration - self.min_concentration) * 255
-        self.pred_var_norm = self.pred_var/self.sigma2_all * 255
-        self._normalize_pred_layers()
+        if not self.return_torch:
+            self.pred_mu = self._tensor_to_obs_channel(current_pred.mean + self.mu_all)
+            self.pred_var = self._tensor_to_obs_channel(current_pred.variance)
+            if self.timer:
+                print(f't3.3 step: {time.process_time()-t}')
+            
+            # Scale to 0-255 ([min_conc, max_conc] from scenario bank)
+            t = time.process_time()
+            self.pred_mu_norm = (self.pred_mu - self.min_concentration) / (self.max_concentration - self.min_concentration) * 255
+            self.pred_var_norm = self.pred_var/self.sigma2_all * 255
+            self._normalize_pred_layers()
 
         # Maintain torch versions for on-device rewards.
         self.pred_mu_t = current_pred.mean.view(self.obs_y, self.obs_x) + self.mu_all
@@ -986,9 +1223,23 @@ class GasSurveyDubinsEnv(gym.Env):
         scale : float
             Multiplier defining the radius of influence (~3 is typical).
         """
-        # --- 1. Extract recent sample coordinates (convert to CPU numpy) ---
         new_samples = self.sampled_coords[self.sample_idx_mdl:self.sample_idx]
-        
+
+        if self.return_torch:
+            if new_samples.numel() == 0:
+                return torch.empty((0,), dtype=torch.long, device=self.device)
+
+            corr_length_t = corr_length if torch.is_tensor(corr_length) else torch.tensor(corr_length, device=self.device)
+            update_radius = torch.as_tensor(scale, device=self.device, dtype=corr_length_t.dtype) * corr_length_t
+            coords = self._coords_flat
+            # For large grids, this could be swapped for a torch spatial index.
+            diff = coords.unsqueeze(0) - new_samples.unsqueeze(1)
+            dist2 = (diff ** 2).sum(dim=-1)
+            mask = dist2 <= (update_radius ** 2)
+            idx_tensor = torch.nonzero(mask.any(dim=0), as_tuple=False).squeeze(1)
+            return idx_tensor
+
+        # --- 1. Extract recent sample coordinates (convert to CPU numpy) ---
         if isinstance(new_samples, torch.Tensor):
             new_samples = new_samples.detach().cpu().numpy()
         elif isinstance(new_samples, list):
@@ -1007,7 +1258,7 @@ class GasSurveyDubinsEnv(gym.Env):
 
         # --- 4. Deduplicate and return as tensor indices ---
         idx_unique = np.unique(neighbor_indices)
-        
+
         idx_tensor = torch.as_tensor(idx_unique, dtype=torch.long, device=self.device)
         return idx_tensor
 
@@ -1261,6 +1512,14 @@ def onehot_to_rad(heading_1hot):
     ----------
     one of [math.pi/2, -math.pi/2, -math.pi, math.pi]
     '''
+    if torch.is_tensor(heading_1hot):
+        idx = torch.argmax(heading_1hot).to(dtype=torch.float32)
+        if len(heading_1hot) == 4:
+            return idx * (math.pi / 2.0)
+        if len(heading_1hot) == 8:
+            return idx * (math.pi / 4.0)
+        raise ValueError("heading_1hot must have length 4 or 8")
+
     try:
         idx = list(heading_1hot).index(1)
     except ValueError:
@@ -1319,37 +1578,88 @@ def move_with_heading(
         New heading index (0..n_headings-1).
     """
     # -------- decode current heading index ψ ---------------------------
-    try:
-        h_idx = list(heading_1hot).index(1)
-    except ValueError as e:
-        raise ValueError("heading_1hot must have exactly one 1") from e
-    if not (0 <= h_idx < n_headings):
-        raise ValueError(f"heading index {h_idx} outside 0..{n_headings-1}")
+    is_torch = torch.is_tensor(heading_1hot)
+    if is_torch:
+        device = heading_1hot.device
+        h_idx_t = torch.argmax(heading_1hot).to(dtype=torch.long)
+    else:
+        try:
+            h_idx = list(heading_1hot).index(1)
+        except ValueError as e:
+            raise ValueError("heading_1hot must have exactly one 1") from e
+        if not (0 <= h_idx < n_headings):
+            raise ValueError(f"heading index {h_idx} outside 0..{n_headings-1}")
 
-    psi = 2.0 * math.pi * (h_idx / n_headings)   # radians; 0 = +x, CCW positive
+    if is_torch:
+        psi = 2.0 * math.pi * (h_idx_t.to(dtype=torch.float32) / n_headings)
+    else:
+        psi = 2.0 * math.pi * (h_idx / n_headings)   # radians; 0 = +x, CCW positive
 
     # -------- decode action -------------------------------------------
+    action_idx = None
+    action_idx_t = None
     if isinstance(action, str):
         action = action.lower()
         if action not in ("left", "straight", "right"):
             raise ValueError("action must be 'left', 'straight', or 'right'")
-    elif isinstance(action, int) or isinstance(action, np.int64):
-        if action not in (0, 1, 2):
-            raise ValueError("int action must be 0:'left', 1:'straight', 2:'right'")
-        action = ("left", "straight", "right")[action]
+        action_idx = ("left", "straight", "right").index(action)
+    elif torch.is_tensor(action):
+        if action.numel() != 1:
+            raise ValueError("action tensor must be a single scalar")
+        if is_torch:
+            action_idx_t = action.to(device=device, dtype=torch.long)
+        else:
+            action_idx = int(action.item())
+    elif isinstance(action, (int, np.integer)):
+        action_idx = int(action)
     else:
         print(f'action.dtype: {type(action)}')
         raise TypeError("action must be int or str")
 
+    if action_idx is not None:
+        if action_idx not in (0, 1, 2):
+            raise ValueError("action must be 0:'left', 1:'straight', 2:'right'")
+        if is_torch:
+            action_idx_t = torch.tensor(action_idx, device=device, dtype=torch.long)
+    elif is_torch and action_idx_t is None:
+        action_idx_t = action.to(device=device, dtype=torch.long)
+
     theta = math.radians(turn_degrees)          # arc angle for turns
     r = float(turn_radius)
+    bins_per_turn = int(round(theta / (2 * math.pi / n_headings)))
 
-    # -------- local-frame displacements --------------------------------
-    # Define a local frame: +y forward (along current heading), +x to the right.
-    # For a left turn by theta on a circle of radius r:
-    #   dx_local = - r * sin(theta)
-    #   dy_local =   r * (1 - cos(theta))
-    # For a right turn: dx_local = + r * sin(theta), dy_local same.
+    if is_torch:
+        theta_t = torch.tensor(theta, device=device, dtype=torch.float32)
+        r_t = torch.tensor(r, device=device, dtype=torch.float32)
+        sin_t = torch.sin(theta_t)
+        cos_t = torch.cos(theta_t)
+        if forward_step is not None:
+            dist_t = torch.tensor(float(forward_step), device=device, dtype=torch.float32)
+        else:
+            dist_t = r_t * theta_t if straight_matches_arc else r_t
+
+        dx_local_table = torch.stack((r_t * sin_t, dist_t, r_t * sin_t))
+        dy_local_table = torch.stack((r_t * (1 - cos_t), torch.tensor(0.0, device=device), -r_t * (1 - cos_t)))
+        dx_local = dx_local_table[action_idx_t]
+        dy_local = dy_local_table[action_idx_t]
+
+        cos_psi, sin_psi = torch.cos(psi), torch.sin(psi)
+        dx_world =  cos_psi * dx_local - sin_psi * dy_local
+        dy_world =  sin_psi * dx_local + cos_psi * dy_local
+
+        delta_bins_table = torch.tensor([bins_per_turn, 0, -bins_per_turn], device=device, dtype=torch.long)
+        delta_bins = delta_bins_table[action_idx_t]
+        new_idx = (h_idx_t + delta_bins) % n_headings
+
+        new_onehot = torch.zeros(n_headings, device=device, dtype=torch.int64)
+        new_onehot.scatter_(0, new_idx.view(1), 1)
+        return (
+            torch.stack((dx_world, dy_world)).to(device=device, dtype=torch.float32),
+            new_onehot,
+        )
+
+    # -------- local-frame displacements (numpy path) --------------------
+    action = ("left", "straight", "right")[action_idx]
     if action == "left":
         dx_local = r * math.sin(theta)
         dy_local = r * (1 - math.cos(theta))
@@ -1359,7 +1669,6 @@ def move_with_heading(
         dy_local =  -r * (1 - math.cos(theta))
         heading_delta_bins = -1                 # rotate CW by one bin
     else:  # "straight"
-        # distance for straight move
         if forward_step is not None:
             dist = float(forward_step)
         else:
@@ -1368,19 +1677,10 @@ def move_with_heading(
         dy_local = 0.0
         heading_delta_bins = 0
 
-    # -------- rotate local displacement into world frame ---------------
-    # Local-to-world rotation by current heading angle ψ
-    # local basis: [right, forward]; world x = cosψ*right - sinψ*forward
-    # Using matrix for vector [dx_local, dy_local] where dy_local is along forward:
     cos_psi, sin_psi = math.cos(psi), math.sin(psi)
     dx_world =  cos_psi * dx_local - sin_psi * dy_local
     dy_world =  sin_psi * dx_local + cos_psi * dy_local
 
-    # -------- update heading index -------------------------------------
-    # If the heading lattice step equals the turn angle (e.g., 8 bins + 45°)
-    # then moving left/right advances by exactly one bin. More generally,
-    # we advance by round(theta / (2π / n_headings)) bins.
-    bins_per_turn = int(round(theta / (2 * math.pi / n_headings)))
     if action == "straight":
         delta_bins = 0
     else:

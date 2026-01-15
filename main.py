@@ -6,13 +6,138 @@ Step 0 wires config loading; later steps add env, MCTS, and training.
 from __future__ import annotations
 
 import importlib
+import time
 from pathlib import Path
 
 import chem_utils
 import helpers
 import rl_gas_survey_dubins_env
 import rl_scenario_bank
+import policy_value_net
+import EnvAdapterClass
+import alphaMCTS
 
+
+def _build_scenario_bank(
+    cfg: "helpers.Config",
+    cutoff_percentage_min: float = 6.0,
+    cutoff_percentage_max: float = 100.0,
+) -> rl_scenario_bank.ScenarioBank:
+    if cfg.general.tensor_env_file is None:
+        raise ValueError("general.tensor_env_file must be set in config.json.")
+
+    bank = rl_scenario_bank.ScenarioBank(data_dir=str(cfg.general.tensor_envs_dir))
+    bank.load_envs(cfg.general.tensor_env_file, device=cfg.general.device)
+
+    sensor_min, sensor_max = cfg.general.sensor_range
+    bank.clip_sensor_range(parameter=cfg.general.gas_type, min=sensor_min, max=sensor_max)
+    bank.gas_coverage_cutoff(
+        cutoff_concentration=cfg.general.gas_threshold,
+        cutoff_percentage_min=cutoff_percentage_min,
+        cutoff_percentage_max=cutoff_percentage_max,
+    )
+    return bank
+
+
+def train(cfg: "helpers.Config") -> None:
+    import torch
+
+    from replay_buffer import ReplayBuffer
+    from policy_value_net import compute_policy_value_loss
+
+    bank = _build_scenario_bank(cfg)
+    env_adapt = EnvAdapterClass.EnvAdapter(cfg, scenario_bank=bank, return_torch=True)
+    net = policy_value_net.PolicyValueNet(
+        in_channels=cfg.policy_net.in_channels,
+        num_actions=cfg.policy_net.num_actions,
+        aux_dim=cfg.policy_net.aux_dim,
+        trunk_channels=cfg.policy_net.trunk_channels,
+        latent_dim=cfg.policy_net.latent_dim,
+        head_dim=cfg.policy_net.head_dim,
+        value_head_dim=cfg.policy_net.value_head_dim,
+    ).to(env_adapt.device)
+
+    train_cfg = cfg.train_config
+    optimizer = torch.optim.Adam(net.parameters(), lr=train_cfg.learning_rate)
+    buffer = ReplayBuffer(capacity=train_cfg.buffer_capacity, device=env_adapt.device)
+    batch_size = train_cfg.batch_size
+    train_steps = train_cfg.train_steps
+    start_iter = 0
+
+    if train_cfg.resume_path:
+        ckpt = torch.load(train_cfg.resume_path, map_location=env_adapt.device)
+        net.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        buffer.load_state_dict(ckpt["buffer_state"], device=env_adapt.device)
+        if "rng_state" in ckpt:
+            EnvAdapterClass.EnvAdapter._set_rng_state(ckpt["rng_state"])
+        start_iter = int(ckpt.get("iteration", 0) + 1)
+        print(f"Resumed from {train_cfg.resume_path} at iteration {start_iter}")
+
+    total_episodes = 0
+    start_time = time.time()
+
+    for it in range(start_iter, train_cfg.train_num_iterations):
+        episodes = helpers.run_self_play(
+            cfg,
+            policy_net=net,
+            env_adapter=env_adapt,
+        )
+        total_episodes += len(episodes)
+        for ep in episodes:
+            buffer.add_episode(ep)
+
+        if len(buffer) < batch_size:
+            print(f"Iteration {it + 1}/{train_cfg.train_num_iterations}: buffer size {len(buffer)} < {batch_size}, skipping training.")
+            continue
+
+        net.train()
+        for _ in range(train_steps):
+            batch = buffer.sample_batch(batch_size)
+            obs = batch["obs"]
+            if isinstance(obs, dict) and "map" in obs:
+                obs = dict(obs)
+                obs["map"] = obs["map"].to(dtype=torch.float32) / 255.0
+                if "loc" in obs:
+                    obs["loc"] = obs["loc"].to(dtype=torch.float32)
+                if "hdg" in obs:
+                    obs["hdg"] = obs["hdg"].to(dtype=torch.float32)
+
+            policy_logits, value_pred = net(obs)
+            loss_dict = compute_policy_value_loss(
+                net,
+                policy_logits,
+                value_pred,
+                batch["policy"],
+                batch["value"],
+                l2_weight=train_cfg.l2_weight,
+            )
+            optimizer.zero_grad()
+            loss_dict["total"].backward()
+            optimizer.step()
+
+        net.eval()
+        print(
+            f"Iteration {it + 1}/{train_cfg.train_num_iterations}: loss={loss_dict['total'].item():.4f}, "
+            f"policy={loss_dict['policy'].item():.4f}, value={loss_dict['value'].item():.4f}"
+        )
+
+        if train_cfg.checkpoint_every > 0 and (it + 1) % train_cfg.checkpoint_every == 0:
+            ckpt_path = Path(train_cfg.checkpoint_dir) / f"checkpoint_iter_{it + 1}.pt"
+            ckpt = {
+                "model_state": net.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "buffer_state": buffer.state_dict(),
+                "iteration": it,
+                "rng_state": EnvAdapterClass.EnvAdapter._capture_rng_state(),
+            }
+            torch.save(ckpt, ckpt_path)
+            fill_ratio = len(buffer) / buffer.capacity if buffer.capacity else 0.0
+            elapsed_min = max((time.time() - start_time) / 60.0, 1e-6)
+            eps_per_min = total_episodes / elapsed_min
+            print(f"Saved checkpoint to {ckpt_path} (buffer fill {fill_ratio:.1%})")
+            print(f"Episodes per minute: {eps_per_min:.2f}")
+            helpers.evaluate(cfg, net, env_adapter=env_adapt)
 
 def set_seed(seed: int) -> None:
     """Seed RNGs (placeholder)."""
@@ -22,7 +147,7 @@ def set_seed(seed: int) -> None:
 
 def make_run_dir(cfg: "helpers.Config") -> Path:
     """Return the directory for run artifacts (placeholder)."""
-    return Path("runs") / cfg.run_name
+    return Path("runs") / cfg.general.run_name
 
 
 def _reload_modules() -> None:
@@ -31,23 +156,89 @@ def _reload_modules() -> None:
     importlib.reload(rl_scenario_bank)
     importlib.reload(rl_gas_survey_dubins_env)
     importlib.reload(helpers)
+    importlib.reload(policy_value_net)
+    importlib.reload(EnvAdapterClass)
+    importlib.reload(alphaMCTS)
 
+#def main() -> None:
+_reload_modules()
+cfg = helpers.load_config()
+# TODO: wire up env/net/mcts/training loops.
 
-def main() -> None:
-    _reload_modules()
-    cfg = helpers.load_config()
-    # TODO: wire up env/net/mcts/training loops.
+bank = _build_scenario_bank(cfg, cutoff_percentage_min=6, cutoff_percentage_max=100)
+
+test_envs = False
+test_policy_with_envs = False
+test_mcts = False
+test_self_play = False
+
+if test_envs:
     helpers.run_tensor_env_smoke_test(
-        tensor_envs_dir=cfg.tensor_envs_dir,
-        env_file=cfg.tensor_env_file,
-        env_turn_radius=cfg.env_turn_radius,
-        device=cfg.device,
-        seed=cfg.seed,
-        figures_dir=cfg.figures_dir,
+        tensor_envs_dir=cfg.general.tensor_envs_dir,
+        env_file=cfg.general.tensor_env_file,
+        env_turn_radius=cfg.general.env_turn_radius,
+        device=cfg.general.device,
+        seed=cfg.general.seed,
+        figures_dir=cfg.general.figures_dir,
     )
 
+env_adapt = EnvAdapterClass.EnvAdapter(cfg, scenario_bank=bank, return_torch=True)
+net = policy_value_net.PolicyValueNet(
+    in_channels=cfg.policy_net.in_channels,
+    num_actions=cfg.policy_net.num_actions,
+    aux_dim=cfg.policy_net.aux_dim,
+    trunk_channels=cfg.policy_net.trunk_channels,
+    latent_dim=cfg.policy_net.latent_dim,
+    head_dim=cfg.policy_net.head_dim,
+    value_head_dim=cfg.policy_net.value_head_dim,
+).to(env_adapt.device)
 
-if __name__ == "__main__":
-    main()
+print(f"Initialized env adapter on {env_adapt.device}")
+print(f"Initialized policy/value net with {sum(p.numel() for p in net.parameters()):,} params")
+
+if test_policy_with_envs:
+    helpers.run_policy_smoke_test(
+        tensor_envs_dir=cfg.general.tensor_envs_dir,
+        env_file=cfg.general.tensor_env_file,
+        env_turn_radius=cfg.general.env_turn_radius,
+        device=cfg.general.device,
+        seed=cfg.general.seed,
+        figures_dir=cfg.general.figures_dir,
+        policy_net=net,
+    )
+
+if test_mcts:
+    helpers.run_mcts_smoke_test(
+        env_adapter=env_adapt,
+        policy_net=net,
+        num_simulations=cfg.mcts_test.num_simulations,
+        steps=cfg.mcts_test.steps,
+        temperature=cfg.mcts_test.temperature,
+        cpuct=cfg.mcts_test.cpuct,
+        discount=cfg.mcts_test.discount,
+        dirichlet_alpha=cfg.mcts_test.dirichlet_alpha,
+        dirichlet_epsilon=cfg.mcts_test.dirichlet_epsilon,
+        tree_depth_printout=cfg.mcts_test.tree_depth_printout,
+        tree_depth_max=cfg.mcts_test.tree_depth_max,
+        top_k=cfg.mcts_test.top_k,
+        plot_path=cfg.mcts_test.plot_path,
+    )
+
+if test_self_play:
+    episodes = helpers.run_self_play(
+        cfg,
+        policy_net=net,
+        num_episodes=1,
+        env_adapter=env_adapt,
+    )
+    print(f"Completed self-play episodes: {len(episodes)}")
+    
+train(cfg)
+
+
+
+
+#if __name__ == "__main__":
+#    main()
 
 # %%
