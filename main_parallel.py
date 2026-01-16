@@ -167,7 +167,7 @@ def main() -> None:
                 continue
 
             net.train()
-            for _ in range(train_cfg.train_steps):
+            for _ in range(train_cfg.optimizer_steps):
                 batch = buffer.sample_batch(train_cfg.batch_size)
                 obs = batch["obs"]
                 if isinstance(obs, dict) and "map" in obs:

@@ -61,7 +61,7 @@ def train(cfg: "helpers.Config") -> None:
     optimizer = torch.optim.Adam(net.parameters(), lr=train_cfg.learning_rate)
     buffer = ReplayBuffer(capacity=train_cfg.buffer_capacity, device=env_adapt.device)
     batch_size = train_cfg.batch_size
-    train_steps = train_cfg.train_steps
+    train_steps = train_cfg.optimizer_steps
     start_iter = 0
 
     if train_cfg.resume_path:
@@ -75,20 +75,26 @@ def train(cfg: "helpers.Config") -> None:
         print(f"Resumed from {train_cfg.resume_path} at iteration {start_iter}")
 
     total_episodes = 0
-    start_time = time.time()
+    selfplay_seconds = 0.0
 
     for it in range(start_iter, train_cfg.train_num_iterations):
+        selfplay_start = time.time()
         episodes = helpers.run_self_play(
             cfg,
             policy_net=net,
             env_adapter=env_adapt,
         )
+        selfplay_seconds += time.time() - selfplay_start
         total_episodes += len(episodes)
         for ep in episodes:
             buffer.add_episode(ep)
 
         if len(buffer) < batch_size:
-            print(f"Iteration {it + 1}/{train_cfg.train_num_iterations}: buffer size {len(buffer)} < {batch_size}, skipping training.")
+            eps_per_min = total_episodes / max(selfplay_seconds / 60.0, 1e-6)
+            print(
+                f"Iteration {it + 1}/{train_cfg.train_num_iterations}: loss=nan, policy=nan, "
+                f"value=nan, episodes/min={eps_per_min:.2f} (buffer {len(buffer)}/{batch_size})"
+            )
             continue
 
         net.train()
@@ -117,9 +123,11 @@ def train(cfg: "helpers.Config") -> None:
             optimizer.step()
 
         net.eval()
+        eps_per_min = total_episodes / max(selfplay_seconds / 60.0, 1e-6)
         print(
             f"Iteration {it + 1}/{train_cfg.train_num_iterations}: loss={loss_dict['total'].item():.4f}, "
-            f"policy={loss_dict['policy'].item():.4f}, value={loss_dict['value'].item():.4f}"
+            f"policy={loss_dict['policy'].item():.4f}, value={loss_dict['value'].item():.4f}, "
+            f"episodes/min={eps_per_min:.2f}"
         )
 
         if train_cfg.checkpoint_every > 0 and (it + 1) % train_cfg.checkpoint_every == 0:
@@ -133,10 +141,7 @@ def train(cfg: "helpers.Config") -> None:
             }
             torch.save(ckpt, ckpt_path)
             fill_ratio = len(buffer) / buffer.capacity if buffer.capacity else 0.0
-            elapsed_min = max((time.time() - start_time) / 60.0, 1e-6)
-            eps_per_min = total_episodes / elapsed_min
             print(f"Saved checkpoint to {ckpt_path} (buffer fill {fill_ratio:.1%})")
-            print(f"Episodes per minute: {eps_per_min:.2f}")
             helpers.evaluate(cfg, net, env_adapter=env_adapt)
 
 def set_seed(seed: int) -> None:
@@ -171,6 +176,7 @@ test_envs = False
 test_policy_with_envs = False
 test_mcts = False
 test_self_play = False
+do_training = True
 
 if test_envs:
     helpers.run_tensor_env_smoke_test(
@@ -218,6 +224,10 @@ if test_mcts:
         discount=cfg.mcts_test.discount,
         dirichlet_alpha=cfg.mcts_test.dirichlet_alpha,
         dirichlet_epsilon=cfg.mcts_test.dirichlet_epsilon,
+        rollout_mode=cfg.mcts_test.rollout_mode,
+        rollout_reward_weights=cfg.mcts_test.rollout_reward_weights,
+        rollout_var_reduction_scale=cfg.mcts_test.rollout_var_reduction_scale,
+        rollout_lengthscale=cfg.mcts_test.rollout_lengthscale,
         tree_depth_printout=cfg.mcts_test.tree_depth_printout,
         tree_depth_max=cfg.mcts_test.tree_depth_max,
         top_k=cfg.mcts_test.top_k,
@@ -232,8 +242,9 @@ if test_self_play:
         env_adapter=env_adapt,
     )
     print(f"Completed self-play episodes: {len(episodes)}")
-    
-train(cfg)
+
+if do_training:
+    train(cfg)
 
 
 

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 import EnvAdapterClass
+import alphaMCTS
 
 
 DEFAULT_CONFIG_PATH = Path("config.json")
@@ -68,6 +69,10 @@ class MCTSTestConfig:
     temperature: float = 1.0
     dirichlet_alpha: float | None = None
     dirichlet_epsilon: float = 0.0
+    rollout_mode: str = "belief_surrogate"
+    rollout_reward_weights: tuple[float, float, float] = (0.34, 0.33, 0.33)
+    rollout_var_reduction_scale: float = 0.5
+    rollout_lengthscale: float | None = None
     steps: int = 3
     tree_depth_printout: int = 2
     tree_depth_max: int | None = None
@@ -76,7 +81,10 @@ class MCTSTestConfig:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any], *, source: str | None = None) -> "MCTSTestConfig":
-        return cls(**_filter_config(cls, data, source=source))
+        filtered = _filter_config(cls, data, source=source)
+        if "rollout_reward_weights" in filtered and isinstance(filtered["rollout_reward_weights"], list):
+            filtered["rollout_reward_weights"] = tuple(filtered["rollout_reward_weights"])
+        return cls(**filtered)
 
 
 @dataclass(frozen=True)
@@ -88,10 +96,17 @@ class MCTSConfig:
     dirichlet_alpha: float | None = None
     dirichlet_epsilon: float = 0.0
     tree_depth_max: int | None = None
+    rollout_mode: str = "belief_surrogate"
+    rollout_reward_weights: tuple[float, float, float] = (0.34, 0.33, 0.33)
+    rollout_var_reduction_scale: float = 0.5
+    rollout_lengthscale: float | None = None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any], *, source: str | None = None) -> "MCTSConfig":
-        return cls(**_filter_config(cls, data, source=source))
+        filtered = _filter_config(cls, data, source=source)
+        if "rollout_reward_weights" in filtered and isinstance(filtered["rollout_reward_weights"], list):
+            filtered["rollout_reward_weights"] = tuple(filtered["rollout_reward_weights"])
+        return cls(**filtered)
 
 
 @dataclass(frozen=True)
@@ -109,7 +124,7 @@ class MCTSSelfPlayConfig:
 class TrainConfig:
     buffer_capacity: int = 10_000
     batch_size: int = 32
-    train_steps: int = 10
+    optimizer_steps: int = 10
     learning_rate: float = 1e-3
     l2_weight: float = 1e-4
     train_num_iterations: int = 5
@@ -484,6 +499,10 @@ def build_mcts_from_config(cfg: Config, policy_net, device=None):
         dirichlet_alpha=mcts_cfg.dirichlet_alpha,
         dirichlet_epsilon=mcts_cfg.dirichlet_epsilon,
         tree_depth_max=mcts_cfg.tree_depth_max,
+        rollout_mode=mcts_cfg.rollout_mode,
+        rollout_reward_weights=mcts_cfg.rollout_reward_weights,
+        rollout_var_reduction_scale=mcts_cfg.rollout_var_reduction_scale,
+        rollout_lengthscale=mcts_cfg.rollout_lengthscale,
         device=device,
     )
 
@@ -515,7 +534,7 @@ def run_self_play(
     episodes = []
     printd(cfg, "Running self play")
     for i in range(episodes_target):
-        printd(cfg, f"Episode #{i}")
+        printd(cfg, f"Episode {i}/{episodes_target}")
         episode = self_play_episode(cfg,
             env_adapter,
             mcts,
@@ -605,6 +624,10 @@ def run_mcts_smoke_test(
     discount: float = 1.0,
     dirichlet_alpha: float | None = None,
     dirichlet_epsilon: float = 0.0,
+    rollout_mode: str = "belief_surrogate",
+    rollout_reward_weights: tuple[float, float, float] = (0.34, 0.33, 0.33),
+    rollout_var_reduction_scale: float = 0.5,
+    rollout_lengthscale: float | None = None,
     tree_depth_printout: int = 2,
     tree_depth_max: int | None = None,
     top_k: int = 3,
@@ -632,6 +655,14 @@ def run_mcts_smoke_test(
         Discount factor used when backing up leaf values.
     dirichlet_alpha, dirichlet_epsilon:
         Optional root noise to encourage exploration; applied to the root prior only.
+    rollout_mode:
+        "env" for true-environment rollouts or "belief_surrogate" for belief-only rollouts.
+    rollout_reward_weights:
+        (value, surprise, variance_reduction) weights for surrogate rollouts.
+    rollout_var_reduction_scale:
+        Multiplier applied to the variance paint-down kernel (0..1 typical).
+    rollout_lengthscale:
+        Overrides GP lengthscale for variance paint-down when provided.
     tree_depth_printout:
         Max depth of tree summaries printed to stdout.
     tree_depth_max:
@@ -676,6 +707,10 @@ def run_mcts_smoke_test(
         dirichlet_alpha=dirichlet_alpha,
         dirichlet_epsilon=dirichlet_epsilon,
         tree_depth_max=tree_depth_max,
+        rollout_mode=rollout_mode,
+        rollout_reward_weights=rollout_reward_weights,
+        rollout_var_reduction_scale=rollout_var_reduction_scale,
+        rollout_lengthscale=rollout_lengthscale,
         device=env_adapter.device,
     )
 
@@ -754,6 +789,49 @@ def run_mcts_smoke_test(
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         print(f"Saved step plot to: {out_path}")
 
+    def _plot_surrogate_variance(
+        step_idx: int,
+        action: int,
+        action_path: "np.ndarray",
+        base_adapter,
+        cumulative_path,
+    ) -> None:
+        import matplotlib.pyplot as plt
+
+        if rollout_mode != "belief_surrogate":
+            return
+        if cumulative_path is not None:
+            if torch.is_tensor(cumulative_path):
+                cumulative_path = cumulative_path.detach().cpu().numpy()
+
+        _obs, _reward, _terminated, _truncated, _info = base_adapter.rollout_step(
+            torch.as_tensor(action, device=base_adapter.device),
+            reward_weights=rollout_reward_weights,
+            var_reduction_scale=rollout_var_reduction_scale,
+            lengthscale=rollout_lengthscale,
+        )
+        var_map = torch.clamp(base_adapter.env.pred_var_norm_t, 0, 255).detach().cpu().numpy()
+
+        fig, ax = plt.subplots(figsize=(6.5, 5.0))
+        extent = [0, float(base_adapter.env.env_x_max), 0, float(base_adapter.env.env_y_max)]
+        im = ax.imshow(var_map, origin="lower", extent=extent, cmap="viridis")
+        if cumulative_path is not None and len(cumulative_path) > 1:
+            ax.plot(cumulative_path[:, 0], cumulative_path[:, 1], color="black", linewidth=0.8, alpha=0.6)
+        ax.plot(action_path[:, 0], action_path[:, 1], color="black", linewidth=1.0)
+        ax.scatter(action_path[-1, 0], action_path[-1, 1], color="black", s=20)
+        ax.set_title(f"Surrogate variance after action {action}")
+        ax.set_xlabel("Easting [m]")
+        ax.set_ylabel("Northing [m]")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Variance (norm)")
+
+        out_path = (
+            Path(base_adapter.cfg.general.figures_dir) / f"mcts_step_{step_idx + 1}_var.png"
+            if plot_path is None
+            else Path(plot_path).with_name(f"{Path(plot_path).stem}_step_{step_idx + 1}_var{Path(plot_path).suffix}")
+        )
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        print(f"Saved surrogate variance plot to: {out_path}")
+
     for step_idx in range(steps):
         policy, root_value, root_node = mcts.run_search(env_adapter, return_root=True)
         action_paths = _compute_action_paths(policy)
@@ -765,6 +843,7 @@ def run_mcts_smoke_test(
         print_tree(root_node, depth=0)
 
         action = int(torch.argmax(policy).item())
+        pre_step_clone = env_adapter.clone()
         _obs, reward, terminated, truncated, _info = env_adapter.env.step(
             torch.as_tensor(action, device=env_adapter.device)
         )
@@ -774,6 +853,15 @@ def run_mcts_smoke_test(
             f"terminated={terminated}, truncated={truncated}"
         )
         _plot_mcts_step(step_idx, policy, action_paths)
+        if action in action_paths:
+            cumulative_path = env_adapter.env.sampled_coords[: env_adapter.env.sample_idx]
+            _plot_surrogate_variance(
+                step_idx,
+                action,
+                action_paths[action],
+                pre_step_clone,
+                cumulative_path,
+            )
         if terminated or truncated:
             break
 

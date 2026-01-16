@@ -43,6 +43,10 @@ class MCTS:
         dirichlet_alpha: Optional[float] = None,
         dirichlet_epsilon: float = 0.0,
         tree_depth_max: Optional[int] = None,
+        rollout_mode: str = "belief_surrogate",
+        rollout_reward_weights: Sequence[float] = (0.34, 0.33, 0.33),
+        rollout_var_reduction_scale: float = 0.5,
+        rollout_lengthscale: float | None = None,
         device: Optional[torch.device] = None,
     ) -> None:
         self.net = net
@@ -53,6 +57,10 @@ class MCTS:
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = float(dirichlet_epsilon)
         self.tree_depth_max = tree_depth_max
+        self.rollout_mode = rollout_mode
+        self.rollout_reward_weights = tuple(rollout_reward_weights)
+        self.rollout_var_reduction_scale = float(rollout_var_reduction_scale)
+        self.rollout_lengthscale = rollout_lengthscale
         self.device = device or next(net.parameters()).device
 
     def run_search(self, root_env, return_root: bool = False):
@@ -90,7 +98,7 @@ class MCTS:
                     depth_limit_hit = True
                     break
                 action, action_t = self._select_action(node)
-                obs, reward, terminated, truncated, _info = self._env_step(env, action_t)
+                obs, reward, terminated, truncated, _info = self._env_rollout_step(env, action_t)
                 reward_t = reward if torch.is_tensor(reward) else torch.as_tensor(reward, device=self.device, dtype=torch.float32)
                 search_path.append((node, reward_t))
                 node = node.children[action]
@@ -270,3 +278,15 @@ class MCTS:
             env_adapter._rng_state = env_adapter._capture_rng_state()
 
         return obs, reward, terminated, truncated, info
+
+    def _env_rollout_step(self, env_adapter, action: torch.Tensor):
+        if self.rollout_mode == "env":
+            return self._env_step(env_adapter, action)
+        if self.rollout_mode == "belief_surrogate":
+            return env_adapter.rollout_step(
+                action,
+                reward_weights=self.rollout_reward_weights,
+                var_reduction_scale=self.rollout_var_reduction_scale,
+                lengthscale=self.rollout_lengthscale,
+            )
+        raise ValueError(f"Unknown rollout_mode: {self.rollout_mode}")

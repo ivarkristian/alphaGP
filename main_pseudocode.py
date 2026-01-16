@@ -217,7 +217,7 @@ def train(cfg):
     #       episode = self_play_episode(env, mcts, cfg)
     #       buffer.add_episode(episode)
     #
-    #   for step in range(cfg.train_steps_per_iter):
+    #   for step in range(cfg.optimizer_steps_per_iter):
     #       batch = buffer.sample_batch(cfg.batch_size)
     #       policy_logits, value_pred = net(batch.obs)
     #       loss = compute_losses(...)
