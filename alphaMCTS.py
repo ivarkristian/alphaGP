@@ -84,9 +84,19 @@ class MCTS:
 
         root_node.expand(policy_probs, root_legal)
 
+        root_state = None
+        if self.rollout_mode == "belief_surrogate" and hasattr(root_env, "snapshot_state"):
+            # Belief-surrogate rollouts only mutate a small subset of state,
+            # so snapshot/restore is much cheaper than deep-copying the full env.
+            root_state = root_env.snapshot_state()
+
         for _ in range(self.num_simulations):
             node = root_node
-            env = root_env.clone()
+            if root_state is not None:
+                root_env.restore_state(root_state)
+                env = root_env
+            else:
+                env = root_env.clone()
             search_path: List[Tuple[Node, torch.Tensor]] = []
 
             done = False
@@ -120,6 +130,9 @@ class MCTS:
                 leaf_value = value[0]
 
             self._backpropagate(search_path, leaf_value)
+
+        if root_state is not None:
+            root_env.restore_state(root_state)
 
         policy = self._visits_to_policy(root_node, self.temperature, num_actions=int(root_policy.shape[-1]))
         if return_root:

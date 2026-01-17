@@ -64,7 +64,11 @@
     "train_num_iterations": 6,
     "checkpoint_dir": "checkpoints",
     "checkpoint_every": 2,
-    "resume_path": null
+    "resume_path": null,
+    "wandb_enabled": true,
+    "wandb_project": "alphaMCTS",
+    "wandb_entity": null,
+    "wandb_mode": "online"
   },
   "parallel": {
     "num_workers": 2,

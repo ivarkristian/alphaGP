@@ -1,7 +1,7 @@
 """Shared helpers for configuration and utilities."""
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -131,6 +131,10 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints"
     checkpoint_every: int = 1
     resume_path: str | None = None
+    wandb_enabled: bool = False
+    wandb_project: str = "alphaMCTS"
+    wandb_entity: str | None = None
+    wandb_mode: str = "online"
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any], *, source: str | None = None) -> "TrainConfig":
@@ -199,6 +203,21 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
     cfg = Config.from_dict(data, source=str(path))
     _ensure_config_dirs(cfg)
     return cfg
+
+def build_wandb_config(cfg: Config) -> dict[str, Any]:
+    """Build a compact W&B config payload with run metadata and hyperparameters."""
+    env_file = Path(cfg.general.tensor_env_file).name if cfg.general.tensor_env_file else None
+    return {
+        "run_name": cfg.general.run_name,
+        "device": cfg.general.device,
+        "tensor_env_file": env_file,
+        "gas_type": cfg.general.gas_type,
+        "gas_threshold": cfg.general.gas_threshold,
+        "policy_net": asdict(cfg.policy_net),
+        "mcts": asdict(cfg.mcts),
+        "mcts_self_play": asdict(cfg.mcts_self_play),
+        "train_config": asdict(cfg.train_config),
+    }
 
 def printd(cfg: Config, string: None) -> None:
     if cfg.general.run_name == "debug":
@@ -587,6 +606,8 @@ def evaluate(
 
         env_adapter.env.reset()
         total_reward = 0.0
+        if max_steps is None:
+            max_steps = cfg.mcts_self_play.max_steps
         step_limit = max_steps if max_steps is not None else getattr(env_adapter.env, "n_steps_max", None)
 
         done = False

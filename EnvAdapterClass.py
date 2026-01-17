@@ -1,6 +1,13 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from helpers import Config
+
+
 class EnvAdapter:
     """Thin wrapper around GasSurveyDubinsEnv for MCTS-friendly IO."""
-    from helpers import Config
 
     def __init__(self, cfg: Config, scenario_bank=None, channels=None, return_torch: bool = True) -> None:
         import numpy as np
@@ -331,6 +338,59 @@ class EnvAdapter:
         env_copy.return_torch = self.return_torch
         clone_adapter.env = env_copy
         return clone_adapter
+
+    def snapshot_state(self) -> dict:
+        """
+        Capture a lightweight state snapshot for belief-surrogate rollouts.
+
+        This avoids deep-copying the GP model and large buffers for every MCTS simulation.
+        """
+        import torch
+
+        env = self.env
+        heading_t = getattr(env, "heading_t", None)
+        location_t = getattr(env, "location_t", None)
+        pred_var_norm_t = getattr(env, "pred_var_norm_t", None)
+        pred_var_t = getattr(env, "pred_var_t", None)
+
+        state = {
+            "loc": env.loc.detach().clone() if torch.is_tensor(env.loc) else torch.as_tensor(env.loc, device=env.device).clone(),
+            "heading_t": heading_t.detach().clone() if torch.is_tensor(heading_t) else None,
+            "pred_var_norm_t": pred_var_norm_t.detach().clone() if torch.is_tensor(pred_var_norm_t) else None,
+            "pred_var_t": pred_var_t.detach().clone() if torch.is_tensor(pred_var_t) else None,
+            "location_t": location_t.detach().clone() if torch.is_tensor(location_t) else None,
+            "n_steps": int(getattr(env, "n_steps", 0)),
+            "terminated": bool(getattr(env, "terminated", False)),
+        }
+        if hasattr(env, "heading"):
+            state["heading_np"] = env.heading.copy()
+        return state
+
+    def restore_state(self, state: dict) -> None:
+        """
+        Restore a snapshot captured by snapshot_state().
+        """
+        import numpy as np
+        import torch
+
+        env = self.env
+        env.loc = state["loc"].detach().clone()
+        if state.get("heading_t") is not None:
+            env.heading_t = state["heading_t"].detach().clone()
+        if "heading_np" in state:
+            env.heading = state["heading_np"].copy()
+        if state.get("pred_var_norm_t") is not None:
+            env.pred_var_norm_t = state["pred_var_norm_t"].detach().clone()
+        if state.get("pred_var_t") is not None:
+            env.pred_var_t = state["pred_var_t"].detach().clone()
+        if state.get("location_t") is not None:
+            env.location_t = state["location_t"].detach().clone()
+
+        env.n_steps = int(state.get("n_steps", 0))
+        env.terminated = bool(state.get("terminated", False))
+        if hasattr(env, "loc_xy_np"):
+            loc_cpu = env.loc[:2].detach().cpu().numpy() if torch.is_tensor(env.loc) else np.asarray(env.loc[:2])
+            env.loc_xy_np = loc_cpu.astype(np.float32)
 
     @staticmethod
     def _capture_rng_state():

@@ -129,6 +129,21 @@ def main() -> None:
     ).to(env_adapt.device)
     optimizer = torch.optim.Adam(net.parameters(), lr=train_cfg.learning_rate)
     buffer = ReplayBuffer(capacity=train_cfg.buffer_capacity, device=env_adapt.device)
+    wandb_run = None
+    if train_cfg.wandb_enabled:
+        try:
+            import wandb
+        except ImportError:
+            print("wandb is not installed; disabling wandb logging.")
+        else:
+            wandb_kwargs = {
+                "project": train_cfg.wandb_project,
+                "entity": train_cfg.wandb_entity,
+                "name": cfg.general.run_name,
+                "mode": train_cfg.wandb_mode,
+                "config": helpers.build_wandb_config(cfg),
+            }
+            wandb_run = wandb.init(**wandb_kwargs)
 
     start_iter = 0
     if train_cfg.resume_path:
@@ -209,7 +224,22 @@ def main() -> None:
                 torch.save(ckpt, ckpt_path)
                 fill_ratio = len(buffer) / buffer.capacity if buffer.capacity else 0.0
                 print(f"Saved checkpoint to {ckpt_path} (buffer fill {fill_ratio:.1%})")
-                helpers.evaluate(cfg, net, env_adapter=env_adapt)
+                eval_stats = helpers.evaluate(
+                    cfg,
+                    net,
+                    max_steps=cfg.mcts_self_play.max_steps,
+                    env_adapter=env_adapt,
+                )
+                if wandb_run is not None and eval_stats is not None:
+                    wandb_run.log(
+                        {
+                            "iteration": it + 1,
+                            "buffer_fill": fill_ratio,
+                            "eval_mean": eval_stats.get("mean", 0.0),
+                            "eval_median": eval_stats.get("median", 0.0),
+                        },
+                        step=it + 1,
+                    )
     finally:
         stop_event.set()
         for proc in workers:

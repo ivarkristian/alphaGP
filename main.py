@@ -63,6 +63,21 @@ def train(cfg: "helpers.Config") -> None:
     batch_size = train_cfg.batch_size
     train_steps = train_cfg.optimizer_steps
     start_iter = 0
+    wandb_run = None
+    if train_cfg.wandb_enabled:
+        try:
+            import wandb
+        except ImportError:
+            print("wandb is not installed; disabling wandb logging.")
+        else:
+            wandb_kwargs = {
+                "project": train_cfg.wandb_project,
+                "entity": train_cfg.wandb_entity,
+                "name": cfg.general.run_name,
+                "mode": train_cfg.wandb_mode,
+                "config": helpers.build_wandb_config(cfg),
+            }
+            wandb_run = wandb.init(**wandb_kwargs)
 
     if train_cfg.resume_path:
         ckpt = torch.load(train_cfg.resume_path, map_location=env_adapt.device)
@@ -95,6 +110,15 @@ def train(cfg: "helpers.Config") -> None:
                 f"Iteration {it + 1}/{train_cfg.train_num_iterations}: loss=nan, policy=nan, "
                 f"value=nan, episodes/min={eps_per_min:.2f} (buffer {len(buffer)}/{batch_size})"
             )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "iteration": it + 1,
+                        "episodes_per_min": eps_per_min,
+                        "buffer_fill": len(buffer) / buffer.capacity if buffer.capacity else 0.0,
+                    },
+                    step=it + 1,
+                )
             continue
 
         net.train()
@@ -129,6 +153,18 @@ def train(cfg: "helpers.Config") -> None:
             f"policy={loss_dict['policy'].item():.4f}, value={loss_dict['value'].item():.4f}, "
             f"episodes/min={eps_per_min:.2f}"
         )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "iteration": it + 1,
+                    "loss": loss_dict["total"].item(),
+                    "policy_loss": loss_dict["policy"].item(),
+                    "value_loss": loss_dict["value"].item(),
+                    "episodes_per_min": eps_per_min,
+                    "buffer_fill": len(buffer) / buffer.capacity if buffer.capacity else 0.0,
+                },
+                step=it + 1,
+            )
 
         if train_cfg.checkpoint_every > 0 and (it + 1) % train_cfg.checkpoint_every == 0:
             ckpt_path = Path(train_cfg.checkpoint_dir) / f"checkpoint_iter_{it + 1}.pt"
@@ -142,7 +178,15 @@ def train(cfg: "helpers.Config") -> None:
             torch.save(ckpt, ckpt_path)
             fill_ratio = len(buffer) / buffer.capacity if buffer.capacity else 0.0
             print(f"Saved checkpoint to {ckpt_path} (buffer fill {fill_ratio:.1%})")
-            helpers.evaluate(cfg, net, env_adapter=env_adapt)
+            #eval_stats = helpers.evaluate(cfg, net, max_steps=cfg.mcts_self_play.max_steps, env_adapter=env_adapt)
+            #if wandb_run is not None and eval_stats is not None:
+            #    wandb_run.log(
+            #        {
+            #            "eval_mean": eval_stats.get("mean", 0.0),
+            #            "eval_median": eval_stats.get("median", 0.0),
+            #        },
+            #        step=it + 1,
+            #    )
 
 def set_seed(seed: int) -> None:
     """Seed RNGs (placeholder)."""
@@ -238,7 +282,7 @@ if test_self_play:
     episodes = helpers.run_self_play(
         cfg,
         policy_net=net,
-        num_episodes=1,
+        num_episodes=3,
         env_adapter=env_adapt,
     )
     print(f"Completed self-play episodes: {len(episodes)}")
